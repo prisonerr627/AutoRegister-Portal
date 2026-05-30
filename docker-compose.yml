@@ -1,0 +1,16 @@
+services:
+  autoregister:
+    build: .
+    container_name: autoregister
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DATA_DIR=/data
+      - TZ=Asia/Dhaka
+    volumes:
+      - ./data:/data
+      # Optional per-semester course catalog. Mounted (not baked into the image)
+      # so swapping the file each semester only needs a restart, no rebuild.
+      - "./Offered Course Report.xlsx:/app/Offered Course Report.xlsx:ro"
+    ports:
+      - "${DASHBOARD_PORT:-8000}:8000"

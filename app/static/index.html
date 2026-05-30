@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AutoRegister · AIUB</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="wrap">
+
+  <div class="panel">
+    <div class="row spread">
+      <div class="row">
+        <h1>AutoRegister</h1>
+        <span id="regPill" class="pill off">checking…</span>
+        <span id="loginPill" class="pill off">logged out</span>
+      </div>
+      <div class="row">
+        <span id="student" class="muted"></span>
+        <span id="proxyPill" class="pill warn hidden" title="portal traffic is routed through a proxy">proxy</span>
+        <button id="forceBtn" class="ghost" title="Bypass the AIUB open-window check and enter the registration flow now">Force flow: off</button>
+        <button id="confirmBtn" class="sec" title="Finalize registration">Confirm</button>
+        <button id="logoutBtn" class="ghost hidden" title="Log out and clear stored credentials">Log out</button>
+      </div>
+    </div>
+    <div class="row muted" style="margin-top:8px">
+      <span id="semester"></span><span id="lastPoll"></span><span id="preregTimer"></span>
+    </div>
+
+    <div id="loginPanel" class="panel hidden" style="margin-top:12px; background:var(--panel2)">
+      <h2>Log in to the AIUB portal</h2>
+      <div class="row">
+        <input id="liUser" placeholder="AIUB ID (e.g. 25-62595-2)" style="width:200px" />
+        <input id="liPass" type="password" placeholder="password" style="width:200px" />
+        <button id="liBtn">Log in</button>
+      </div>
+      <div id="liCaptcha" class="captcha hidden" style="margin-top:10px">
+        <div class="row">
+          <img id="liCaptchaImg" alt="captcha" />
+          <input id="liCaptchaAns" placeholder="captcha answer" style="width:120px" />
+          <button id="liCaptchaBtn">Submit captcha</button>
+        </div>
+        <small class="hint">Auto-solve is tried first; type here only if it couldn't solve it.</small>
+      </div>
+      <div id="liError" class="warn" style="margin-top:8px"></div>
+      <small class="hint">Credentials are stored locally (in this app's data dir) so it can keep your session alive. ⚠️ AIUB allows one session at a time — don't stay logged into the portal in your browser.</small>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <!-- ALERTS -->
+    <div class="panel">
+      <h2>Create alert</h2>
+      <small class="hint">Watch a course and get a Discord ping — and optionally auto-join — the moment a matching section opens.</small>
+
+      <!-- 1 · Course -->
+      <div class="step">
+        <div class="step-h"><span class="n">1</span> Course to watch</div>
+        <input id="courseSearch" class="fw" placeholder="type to search offered courses…" list="courseList" />
+        <datalist id="courseList"></datalist>
+      </div>
+
+      <!-- 2 · Which sections -->
+      <div class="step">
+        <div class="step-h"><span class="n">2</span> Which sections count as a match?</div>
+        <select id="filterType" class="fw">
+          <option value="any">Any section that opens</option>
+          <option value="section">Only specific section(s)</option>
+          <option value="daytime">Only sections inside a day/time window</option>
+        </select>
+
+        <div id="bySection" class="field hidden" style="margin-top:10px">
+          <label>Section labels — comma-separated, e.g. <b>A, M</b></label>
+          <input id="sectionLabels" placeholder="leave blank for any section" />
+          <small id="catalogSecs" class="hint"></small>
+        </div>
+
+        <div id="byDaytime" class="hidden" style="margin-top:10px">
+          <div class="field"><label>Days <small class="hint">(none = any day)</small></label>
+            <div id="dayChecks" class="chips"></div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div class="field"><label>From <small class="hint">(blank = start of day)</small></label>
+              <input type="time" id="timeStart" step="600" />
+            </div>
+            <div class="field"><label>To <small class="hint">(blank = end of day)</small></label>
+              <input type="time" id="timeEnd" step="600" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3 · On open -->
+      <div class="step">
+        <div class="step-h"><span class="n">3</span> When a matching section opens</div>
+        <label class="opt"><input type="radio" name="joinMode" value="alert" id="modeAlert" checked />
+          <span><b>Just alert me</b> <small class="hint">— Discord ping only, no registration</small></span></label>
+        <label class="opt" style="margin-top:8px"><input type="radio" name="joinMode" value="join" id="modeJoin" />
+          <span><b>Auto-join it</b> <small class="hint">— register me; if it clashes with a registered course, drop the clashing one(s) to make room</small></span></label>
+      </div>
+
+      <!-- 4 · Clash handling (only when auto-joining) -->
+      <div id="clashBlock" class="step hidden">
+        <div class="step-h"><span class="n">4</span> Clash handling</div>
+
+        <!-- specific section(s) / day-time: drop to make room -->
+        <div id="clashDrop">
+          <small class="hint">If the section overlaps a course you're registered in, AutoRegister will drop the clashing course(s) to free the slot, then join. Preview now and choose which it may drop:</small>
+          <div class="row" style="margin-top:10px">
+            <button id="checkClash" class="sec" disabled title="Pick specific section(s) or a day/time window in step 2 first">Check clashes now</button>
+          </div>
+          <div id="clashMsg" class="warn" style="margin-top:8px"></div>
+          <div id="unregTargets" class="hidden" style="margin-top:8px">
+            <label>Courses allowed to drop:</label>
+            <div id="targetChecks"></div>
+          </div>
+        </div>
+
+        <!-- "any section": too broad to drop for -->
+        <div id="clashNoDrop" class="hidden">
+          <small class="hint">⚠️ For <b>any section</b>, auto-join will <b>not</b> drop anything — if an opening clashes with a registered course it's skipped (you still get the alert). Choose <b>specific section(s)</b> or a <b>day/time window</b> in step 2 if you want it to drop to make room.</small>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:18px">
+        <button id="createAlert">Create alert</button>
+      </div>
+    </div>
+
+    <!-- ACTIVE ALERTS -->
+    <div class="panel">
+      <h2>Alerts</h2>
+      <table><tbody id="alertRows"></tbody></table>
+      <p id="noAlerts" class="muted">No alerts yet.</p>
+    </div>
+  </div>
+
+  <!-- REGISTERABLE -->
+  <div class="panel">
+    <div class="row spread">
+      <h2>Registerable courses <span id="regHint" class="muted"></span></h2>
+      <div class="row">
+        <span id="secsTimer" class="muted"></span>
+        <button id="reloadSecsBtn" class="ghost" title="Reload all sections now (also auto-refreshes every 10s)">Reload sections</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th style="width:30%">Course</th><th style="width:110px">Status</th><th>Sections &amp; timing</th></tr></thead>
+      <tbody id="courseRows"></tbody>
+    </table>
+  </div>
+
+  <!-- LOG -->
+  <div class="panel">
+    <h2>Activity</h2>
+    <div id="log" class="log"></div>
+  </div>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

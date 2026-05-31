@@ -28,18 +28,99 @@ from .users import UserContext, manager
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 catalog: Catalog | None = None
+# Serialise catalog (re)builds; flag a download in flight for the dashboard.
+_catalog_lock = asyncio.Lock()
+_catalog_refreshing = False
+
+
+def _catalog_path() -> Path:
+    """The live override (downloaded from the portal) if present, else the bundled
+    seed shipped with the app."""
+    return config.CATALOG_OVERRIDE if config.CATALOG_OVERRIDE.exists() else config.CATALOG_XLSX
+
+
+def _catalog_age_seconds() -> Optional[float]:
+    """Seconds since the active catalog file was last written, or None if missing."""
+    p = _catalog_path()
+    try:
+        return max(0.0, time.time() - p.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _catalog_info() -> dict:
+    age = _catalog_age_seconds()
+    return {
+        "count": len(catalog.titles()) if catalog else 0,
+        "age_seconds": round(age) if age is not None else None,
+        "refreshing": _catalog_refreshing,
+        "source": "live" if config.CATALOG_OVERRIDE.exists() else "bundled",
+    }
+
+
+def _load_catalog() -> None:
+    """(Re)load the global catalog from whichever file is active."""
+    global catalog
+    path = _catalog_path()
+    try:
+        catalog = Catalog.load(path)
+        log.info("loaded catalog: %d courses from %s", len(catalog.titles()), path)
+    except Exception as e:  # noqa: BLE001
+        if catalog is None:
+            catalog = Catalog({})
+        log.exception("catalog load failed (%s): %s", path, e)
+
+
+async def refresh_catalog(session) -> dict:
+    """Download the live Offered Course Report via a logged-in portal session, persist
+    it as the override, and rebuild the global catalog. Returns {ok, count, error}."""
+    global _catalog_refreshing
+    async with _catalog_lock:
+        _catalog_refreshing = True
+        try:
+            data = await session.download_offered_report()
+            tmp = config.CATALOG_OVERRIDE.with_suffix(".xlsx.tmp")
+            tmp.write_bytes(data)
+            # Validate it parses before promoting it over the current catalog.
+            n = len(Catalog.load(tmp).titles())
+            tmp.replace(config.CATALOG_OVERRIDE)
+            _load_catalog()
+            log.info("catalog refreshed from portal: %d courses (%d bytes)", n, len(data))
+            return {"ok": True, "count": n}
+        except Exception as e:  # noqa: BLE001
+            log.exception("catalog refresh failed: %s", e)
+            return {"ok": False, "error": str(e)}
+        finally:
+            _catalog_refreshing = False
+
+
+def maybe_refresh_catalog(session) -> None:
+    """Fire a background catalog refresh if the active file is stale (older than
+    CATALOG_MAX_AGE_HOURS) and one isn't already running. Non-blocking.
+
+    GATED off the live registration flow: the portal serialises every request within a
+    session server-side (ASP.NET session lock), so the ~30s download would freeze the
+    poller/force-flow no matter how we issue it. We therefore skip the auto-refresh
+    while registration is open or force-flow is on (those are the poller's 'engaged'
+    states) — the catalog isn't time-critical, and the manual button is always there."""
+    if _catalog_refreshing:
+        return
+    user = getattr(session, "user", "") or ""
+    if db.get_meta(user, "registration_open", False) or db.get_meta(user, "force_workspace", False):
+        log.info("catalog stale but registration open / force-flow on — deferring refresh (avoid stalling poller)")
+        return
+    age = _catalog_age_seconds()
+    if age is not None and age < config.CATALOG_MAX_AGE_HOURS * 3600:
+        return
+    log.info("catalog is stale (age=%ss) — scheduling background refresh",
+             round(age) if age is not None else "missing")
+    asyncio.create_task(refresh_catalog(session))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global catalog
     log.info("lifespan: startup begin")
-    try:
-        catalog = Catalog.load(config.CATALOG_XLSX)
-        log.info("loaded catalog: %d courses from %s", len(catalog.titles()), config.CATALOG_XLSX)
-    except Exception as e:  # noqa: BLE001
-        catalog = Catalog({})
-        log.exception("catalog load failed: %s", e)
+    _load_catalog()
     await manager.resume_all()
     reaper = asyncio.create_task(_idle_reaper())
     log.info("lifespan: startup complete (idle reaper started)")
@@ -133,6 +214,7 @@ async def status(c: Caller = Depends(caller)):
             "proxy": config.PROXY_URL, "verify_tls": config.VERIFY_TLS, "confirm_q": None,
             "username": None, "sections_next_in": None,
             "sections_refresh_seconds": config.SECTIONS_REFRESH_SECONDS,
+            "catalog": _catalog_info(),
         }
     s = c.ctx.session
     u = c.ctx.username
@@ -160,6 +242,7 @@ async def status(c: Caller = Depends(caller)):
         "username": s.username,
         "sections_next_in": sections_next_in,
         "sections_refresh_seconds": config.SECTIONS_REFRESH_SECONDS,
+        "catalog": _catalog_info(),
     }
 
 
@@ -194,6 +277,8 @@ async def login(request: Request, payload: dict = Body(default={})):
         db.set_meta(u, "needs_login", False)
         db.set_meta(u, "login_error", None)
         ctx.start()
+        # Keep the offered-course catalog current: refresh in the background if stale.
+        maybe_refresh_catalog(ctx.session)
         return {"ok": True, "display_name": ctx.session.display_name}
     except NeedCaptcha as e:
         db.set_meta(u, "needs_captcha", True)
@@ -338,6 +423,19 @@ async def catalog_sections(title: str):
         for label, sec in sorted(c["sections"].items())
     ]
     return {"title": c["title"], "department": c.get("department", ""), "sections": sections}
+
+
+@app.post("/api/catalog/refresh", dependencies=[Depends(require_auth)])
+async def catalog_refresh(c: Caller = Depends(caller)):
+    """Download the latest Offered Course Report from the portal (using the caller's
+    logged-in session) and rebuild the global catalog. Blocks ~30s while the portal
+    generates the file."""
+    ctx = _ctx(c)
+    if not ctx.session.logged_in:
+        return JSONResponse({"ok": False, "error": "log in first"}, status_code=200)
+    res = await refresh_catalog(ctx.session)
+    res["catalog"] = _catalog_info()
+    return res
 
 
 # ─── alerts CRUD ──────────────────────────────────────────────────────────────

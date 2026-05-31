@@ -1,88 +1,83 @@
-"""Read-only test of the REAL sequence: Start -> Select2 -> wait ~2min -> GetPreReg2.
-Does NOT register/unregister. Reuses the saved cookie jar (no re-login if valid)."""
+"""Read-only check of the REAL engaged sequence the poller runs:
+auto_login -> start_status -> select2 -> wait(SELECT2_WAIT) -> get_prereg2 -> load_sections.
+
+Does NOT register/unregister — purely observes. Uses the per-user PortalSession
+(the old module-level `portal.session` singleton was removed in the multi-user
+refactor). Credentials come from the env, like probe_timer.py.
+
+Usage:
+    PROBE_PASSWORD='...' python verify2.py
+Env knobs: PROBE_USER (default 25-62595-2).
+"""
 import asyncio
-import re
-import httpx
-from app import config, portal
+import os
+import time
+
+from app import config
+from app.portal import PortalSession
 from app.schedule import routine_summary
 
-PORTAL = config.PORTAL_BASE
-HDRS = {"User-Agent": config.USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
-CONFIRM_RE = re.compile(r"/Student/Registration/Confirm\?q=([^\"'&\s]+)")
+USER = os.environ.get("PROBE_USER", "25-62595-2").strip()
+PASSWORD = os.environ.get("PROBE_PASSWORD", "").strip()
 
 
-def fp():
-    v = portal.session.cookies.get("NAABSUMSMVCFORMSAUTH", "")
+def fp(s: PortalSession) -> str:
+    v = s.cookies.get("NAABSUMSMVCFORMSAUTH", "")
     return (v[:12] + "…") if v else "(none)"
 
 
-async def main():
-    s = portal.session
-    async with httpx.AsyncClient(follow_redirects=False, timeout=30.0, headers=HDRS) as c:
-        # ensure session
-        if not s.cookies.get("NAABSUMSMVCFORMSAUTH"):
-            print("no saved cookie -> logging in")
-            await s.auto_login()
-        def merge(r):
-            n = dict(r.cookies)
-            if n: s.cookies.update(n); s._save_cookies()
+async def main() -> None:
+    s = PortalSession(USER)
+    if PASSWORD:
+        s.set_credentials(USER, PASSWORD)
+    t0 = time.time()
 
-        print("auth cookie:", fp())
-        r = await c.get(f"{PORTAL}/Student/Registration/Start",
-                        cookies=s.cookies, headers={"Referer": f"{PORTAL}/Student"})
-        merge(r)
-        html = r.text
-        if 'name="UserName"' in html:
-            print("session expired -> re-login"); await s.auto_login()
-            r = await c.get(f"{PORTAL}/Student/Registration/Start", cookies=s.cookies); merge(r); html = r.text
-        not_allowed = "You are not allowed to do registration Today" in html
-        has_start = "Confirmation(" in html
-        print(f"[Start] status={r.status_code} not_allowed_today={not_allowed} start_button={has_start}")
+    # Reuse saved cookies if this user already has a valid jar; else log in.
+    if not s.cookies.get("NAABSUMSMVCFORMSAUTH"):
+        if not s.has_credentials():
+            print("no saved cookie and no PROBE_PASSWORD set — cannot log in"); return
+        print("no saved cookie -> logging in")
+        await s.auto_login()
+    print(f"[{time.time()-t0:5.1f}s] auth cookie: {fp(s)}  user={s.display_name or USER}")
 
-        r = await c.get(f"{PORTAL}/Student/Registration/Select2",
-                        cookies=s.cookies, headers={"Referer": f"{PORTAL}/Student/Registration/Start"})
-        merge(r)
-        loc = r.headers.get("location", "")
-        m = CONFIRM_RE.search(r.text)
-        print(f"[Select2] status={r.status_code} len={len(r.text)} location={loc!r} confirm_q={bool(m)}")
+    st = await s.start_status()
+    not_allowed = not st["open"]
+    print(f"[{time.time()-t0:5.1f}s] [Start] open={st['open']} not_allowed_today={not_allowed} "
+          f"student={st.get('student', {}).get('Name', '?')}")
 
-        wait = config.SELECT2_WAIT_SECONDS
-        print(f"\nwaiting {wait}s for the server timer (cookie now {fp()})…")
-        await asyncio.sleep(wait)
+    sel = await s.select2()
+    # Select2 302-bounces to Start while the window is closed (no confirm token); that
+    # still starts the server-side timer, so GetPreReg2 works ~SELECT2_WAIT later.
+    print(f"[{time.time()-t0:5.1f}s] [Select2] ok={sel['ok']} confirm_q={bool(sel.get('q'))}")
 
-        r = await c.get(f"{PORTAL}/Student/Registration/GetPreReg2",
-                        cookies=s.cookies,
-                        headers={"Referer": f"{PORTAL}/Student/Registration/Select2",
-                                 "Accept": "application/json, text/plain, */*",
-                                 "X-Requested-With": "XMLHttpRequest"})
-        merge(r)
-        print(f"[GetPreReg2] status={r.status_code} ct={r.headers.get('content-type','')}")
-        try:
-            j = r.json()
-        except Exception:
-            print("non-JSON body head:", r.text[:200]); return
-        if j.get("HasError"):
-            print("HasError:", j.get("Message")); return
-        print("semester:", (j.get("Semester") or {}).get("Title"))
-        courses = j.get("RegisterableCourses", [])
-        print("registerable courses:", len(courses))
-        for cc in courses:
-            print(f"  - {cc['Title']} [{cc['Status']}] offered={cc.get('OfferedCourseId')} secs={len(cc.get('RegisterableSections',[]))}")
-        # read-only LoadSections on a course with no sections shown
-        target = next((x for x in courses if not x.get("RegisterableSections")), courses[0] if courses else None)
-        if target:
-            print(f"\n[LoadSections] {target['Title']} (read-only)")
-            lr = await c.post(f"{PORTAL}/Student/Registration/LoadSections",
-                              cookies=s.cookies,
-                              headers={"Referer": f"{PORTAL}/Student/Registration/Select2",
-                                       "Content-Type": "application/json;charset=UTF-8",
-                                       "Origin": PORTAL, "Accept": "application/json, text/plain, */*"},
-                              json={"course": target})
-            merge(lr)
-            data = (lr.json() or {}).get("Data") or {}
-            for sec in (data.get("RegisterableSections") or [])[:6]:
-                print(f"   [{sec['Title']}] {sec['StudentCount']}/{sec['Capacity']} :: {routine_summary(sec.get('Routine',''))}")
-        print("\ncookie after sequence:", fp(), "\nDONE (read-only).")
+    wait = config.SELECT2_WAIT_SECONDS
+    print(f"[{time.time()-t0:5.1f}s] waiting {wait}s for the server timer (cookie {fp(s)})…")
+    await asyncio.sleep(wait)
+
+    pre = await s.get_prereg2()
+    if pre.get("HasError"):
+        print(f"[{time.time()-t0:5.1f}s] [GetPreReg2] HasError: {pre.get('Message')}"); return
+    courses = pre.get("RegisterableCourses", [])
+    print(f"[{time.time()-t0:5.1f}s] [GetPreReg2] semester={(pre.get('Semester') or {}).get('Title')} "
+          f"registerable_courses={len(courses)}")
+    for cc in courses:
+        print(f"   - {cc['Title']} [{cc.get('Status')}] offered={cc.get('OfferedCourseId')} "
+              f"secs={len(cc.get('RegisterableSections', []))}")
+
+    # Read-only LoadSections on a course whose sections aren't inlined yet.
+    target = next((x for x in courses if not x.get("RegisterableSections")), courses[0] if courses else None)
+    if target:
+        print(f"\n[{time.time()-t0:5.1f}s] [LoadSections] {target['Title']} (read-only)")
+        loaded = await s.load_sections(target)
+        secs = (loaded.get("Data") or {}).get("RegisterableSections") or []
+        for sec in secs[:6]:
+            print(f"   [{sec.get('Title')}] {sec.get('StudentCount')}/{sec.get('Capacity')} "
+                  f":: {routine_summary(sec.get('Routine', ''))}")
+        if not secs:
+            print("   (no sections published yet)")
+
+    print(f"\ncookie after sequence: {fp(s)}\nDONE (read-only — no register/unregister).")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

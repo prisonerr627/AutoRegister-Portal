@@ -69,6 +69,8 @@ async function refreshStatus() {
     ? Date.now() + s.sections_next_in * 1000 : null;
   renderSectionsTimer();
 
+  renderCatalog(s.catalog, s.logged_in);
+
   // Login panel vs logged-in chrome.
   $("loginPanel").classList.toggle("hidden", s.logged_in);
   $("logoutBtn").classList.toggle("hidden", !s.logged_in);
@@ -111,6 +113,50 @@ $("confirmBtn").onclick = async () => {
   if (!confirm("Finalize registration now?")) return;
   const r = await api("/api/confirm", { method: "POST" });
   alert("Confirm HTTP " + r.status);
+};
+
+// ─── catalog (offered-course report) ─────────────────────────────────────────
+function fmtAge(sec) {
+  if (sec == null) return "never";
+  if (sec < 90) return "just now";
+  const m = Math.round(sec / 60);
+  if (m < 90) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 36) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+let catalogRefreshing = false;  // guard against double-clicks / status overwrite
+function renderCatalog(c, loggedIn) {
+  const btn = $("refreshCatalogBtn");
+  const age = $("catalogAge");
+  if (!btn || !age) return;
+  if (!c) { age.textContent = ""; return; }
+  const busy = catalogRefreshing || c.refreshing;
+  age.textContent = busy
+    ? "Catalog: refreshing…"
+    : `Catalog: ${c.count} courses · ${c.source === "live" ? "updated " + fmtAge(c.age_seconds) : "bundled (never refreshed)"}`;
+  if (!catalogRefreshing) {
+    btn.disabled = !loggedIn || c.refreshing;
+    btn.textContent = c.refreshing ? "Refreshing…" : "Refresh catalog";
+  }
+}
+$("refreshCatalogBtn").onclick = async () => {
+  const btn = $("refreshCatalogBtn");
+  catalogRefreshing = true;
+  btn.disabled = true; btn.textContent = "Refreshing…";
+  $("catalogAge").textContent = "Catalog: refreshing… (~30s)";
+  try {
+    const r = await api("/api/catalog/refresh", { method: "POST" });
+    if (!r.ok) { $("catalogAge").textContent = "Catalog: refresh failed — " + (r.error || "error"); }
+  } catch (e) {
+    $("catalogAge").textContent = "Catalog: refresh failed";
+  } finally {
+    catalogRefreshing = false;
+    btn.textContent = "Refresh catalog";
+    refreshStatus();
+    // Re-run the picker so the freshly-loaded sections show.
+    if ($("courseSearch").value) loadCatalogSections();
+  }
 };
 
 // ─── catalog search ────────────────────────────────────────────────────────

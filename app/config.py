@@ -43,7 +43,7 @@ OPENROUTER_MODELS = [
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 
 POLL_INTERVAL_CLOSED = _int("POLL_INTERVAL_CLOSED", 20)
-POLL_INTERVAL_OPEN = _int("POLL_INTERVAL_OPEN", 4)
+POLL_INTERVAL_OPEN = _int("POLL_INTERVAL_OPEN", 1)
 KEEPALIVE_SECONDS = _int("KEEPALIVE_SECONDS", 240)
 # Mandatory server-side delay between entering Select2 and being allowed to call
 # GetPreReg2. Calling earlier returns "You tried to manipulate your session".
@@ -81,13 +81,19 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "autoregister.db"
 COOKIE_PATH = DATA_DIR / "cookies.json"
 
-# The Offered Course Report lives at the project root (mounted into the container).
+# The bundled Offered Course Report (committed seed) lives at the project root.
 CATALOG_XLSX = Path(
     os.environ.get(
         "CATALOG_XLSX",
         str(Path(__file__).resolve().parent.parent / "Offered Course Report.xlsx"),
     )
 )
+# A live copy downloaded from the portal lands in the (writable) data dir and takes
+# precedence over the bundled seed — so the catalog stays current per semester. It is
+# refreshed in the background on login when older than CATALOG_MAX_AGE_HOURS, or on
+# demand via the dashboard's "Refresh catalog" button.
+CATALOG_OVERRIDE = DATA_DIR / "Offered Course Report.xlsx"
+CATALOG_MAX_AGE_HOURS = _int("CATALOG_MAX_AGE_HOURS", 24)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

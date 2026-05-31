@@ -37,6 +37,13 @@ _REG_COURSE_RE = re.compile(r"^\s*(\d+)\s*-\s*(.+?)\s*\[([^\]]+)\]\s*$")
 # *summary* (with real class times) is only reachable via /Student/Registration?q=
 # <token>, which the /Student dashboard always exposes (window open or closed).
 _REG_Q_RE = re.compile(r"/Student/Registration\?q=[^\"'<>\s]+")
+# The "Offered Course Report" xlsx is downloadable live (so the catalog never goes
+# stale per semester). The Download button on /Student/Section/Offered?q=<token>
+# points at /Common/Section/DownloadOfferedReport (no q token needed; the portal
+# generates the xlsx server-side, ~30s). We hit that path directly, scraping the
+# real href off the Offered page only as a fallback.
+_OFFERED_Q_RE = re.compile(r"/Student/Section/Offered\?q=[^\"'<>\s]+")
+_DOWNLOAD_REPORT_RE = re.compile(r"/Common/Section/DownloadOfferedReport[^\"'<>\s]*")
 _REG_TIME_RE = re.compile(
     r"\((?P<type>[^)]*)\)\s*Time:\s*"
     r"(?P<d1>[A-Za-z]{3,})\s+(?P<t1>\d{1,2}:\d{1,2})\s*(?P<ap1>AM|PM)?\s*-\s*"
@@ -165,10 +172,10 @@ class PortalSession:
             if fresh and fresh != old_auth:
                 db.log_event(self.user, "info", "🔄 Session cookie refreshed (auth cookie rotated — session kept alive)")
 
-    def _client(self) -> httpx.AsyncClient:
+    def _client(self, timeout: float = 30.0) -> httpx.AsyncClient:
         kwargs = dict(
             follow_redirects=False,
-            timeout=30.0,
+            timeout=timeout,
             verify=config.VERIFY_TLS,
             headers={
                 "User-Agent": config.USER_AGENT,
@@ -319,6 +326,7 @@ class PortalSession:
         expect_json: bool = False,
         referer: Optional[str] = None,
         retry_login: bool = True,
+        timeout: float = 30.0,
     ) -> httpx.Response:
         url = path if path.startswith("http") else f"{PORTAL}{path}"
         headers: dict[str, str] = {}
@@ -332,7 +340,7 @@ class PortalSession:
             headers["Origin"] = PORTAL
 
         t0 = time.time()
-        async with self._client() as client:
+        async with self._client(timeout) as client:
             resp = await client.request(
                 method, url, params=params, json=json_body,
                 cookies=self.cookies, headers=headers,
@@ -353,6 +361,7 @@ class PortalSession:
             return await self._request(
                 method, path, params=params, json_body=json_body,
                 expect_json=expect_json, referer=referer, retry_login=False,
+                timeout=timeout,
             )
         return resp
 
@@ -548,3 +557,53 @@ class PortalSession:
             resp = await self._request("GET", f"/Student/Registration/Confirm?q={q}",
                                        referer=f"{PORTAL}/Student/Registration/Select2")
         return {"status": resp.status_code, "text": resp.text[:500]}
+
+    # ─── offered-course report (live catalog xlsx) ────────────────────────
+    @staticmethod
+    def _is_xlsx(body: bytes) -> bool:
+        # .xlsx is a zip archive — magic bytes "PK\x03\x04".
+        return body[:4] == b"PK\x03\x04"
+
+    @traced
+    async def download_offered_report(self) -> bytes:
+        """Download the portal's live 'Offered Course Report.xlsx' and return the raw
+        bytes (same format catalog.py already parses). Needs only a valid session — the
+        Download link carries no q token. The portal builds the file on the fly (~30s),
+        so this uses a long timeout. Fast path hits /Common/Section/DownloadOfferedReport
+        directly; if that ever stops returning an xlsx we scrape the real Download href
+        off the Offered page (which itself needs the dashboard's q token).
+
+        ⚠️ The portal serializes ALL requests within a session server-side (ASP.NET
+        session lock), so this ~30s call freezes the poller regardless of how we issue
+        it — callers MUST gate it off the open window / force-flow (see maybe_refresh_
+        catalog) rather than rely on a client-side trick."""
+        async with self._lock:
+            resp = await self._request(
+                "GET", "/Common/Section/DownloadOfferedReport",
+                referer=f"{PORTAL}/Student", timeout=180.0,
+            )
+        if resp.status_code == 200 and self._is_xlsx(resp.content):
+            return resp.content
+
+        # Fallback: discover the Offered page (q token lives on the dashboard), then
+        # scrape its Download href and follow that.
+        async with self._lock:
+            home = await self._request("GET", "/Student", referer=f"{PORTAL}/")
+        qm = _OFFERED_Q_RE.search(home.text)
+        if not qm:
+            raise LoginError("could not find the Offered-courses link on the dashboard")
+        async with self._lock:
+            page = await self._request("GET", qm.group(0), referer=f"{PORTAL}/Student")
+        dm = _DOWNLOAD_REPORT_RE.search(page.text)
+        if not dm:
+            raise LoginError("could not find the Download link on the Offered-courses page")
+        async with self._lock:
+            resp = await self._request(
+                "GET", dm.group(0), referer=f"{PORTAL}{qm.group(0)}", timeout=180.0,
+            )
+        if resp.status_code == 200 and self._is_xlsx(resp.content):
+            return resp.content
+        raise LoginError(
+            f"Offered report download did not return an xlsx "
+            f"(status={resp.status_code}, content-type={resp.headers.get('content-type','')})"
+        )

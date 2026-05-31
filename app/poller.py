@@ -379,13 +379,33 @@ class Engine:
                       alert["id"], self.user, title)
 
     def _pick_join_section(self, alert: dict, candidates: list[dict], registered: list[dict]) -> dict | None:
-        """Choose which open, matching section to auto-join. For an 'any section' alert
-        we never drop, so pick the NON-CLASHING section that packs most tightly into the
-        existing timetable (least idle gap via schedule_gap); if every open section
-        clashes, join nothing (the user was still alerted). Scoped alerts (specific
-        section / day-time) keep first-match, leaving clash/drop to _try_join."""
-        if alert.get("filter_type") != "any":
-            return candidates[0] if candidates else None
+        """Choose which open, matching section to auto-join.
+
+        - 'specific section': honor the user's TYPED label order — "A, B" tries A first
+          and only falls back to B when A isn't open. Stable sort, so equal-rank ties
+          keep the portal's order.
+        - 'day/time': first match in portal order (a window has no ranked list to honor).
+        - 'any section': never drop — pick the NON-CLASHING section that packs tightest
+          into the existing timetable (least idle gap via schedule_gap); if every open
+          section clashes, join nothing (the user was still alerted).
+        Clash/drop for the scoped modes is left to _try_join."""
+        if not candidates:
+            return None
+        ft = alert.get("filter_type")
+        if ft == "section":
+            labels = [str(x).strip().upper() for x in alert.get("section_labels", [])]
+
+            def _rank(sec: dict) -> int:
+                title = str(sec.get("Title", "")).strip().upper()
+                class_id = str(sec.get("ClassID", "")).strip().upper()
+                for i, lbl in enumerate(labels):
+                    if lbl in (title, class_id):
+                        return i
+                return len(labels)  # unranked (e.g. no labels typed) -> keep portal order
+
+            return sorted(candidates, key=_rank)[0]
+        if ft != "any":
+            return candidates[0]  # day/time: no typed order to rank by
         reg_slots = [s for r in registered for s in r.get("slots", [])]
         scored = []
         for sec in candidates:

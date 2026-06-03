@@ -249,18 +249,22 @@ $("modeAlert").onchange = onModeChange;
 $("modeJoin").onchange = onModeChange;
 
 $("checkClash").onclick = async () => {
-  // Clash = pure time overlap between the day/time window you pick and your
-  // registered courses (course-agnostic). Send the days + From/To window.
+  // Clash = (a) pure time overlap between the day/time window you pick and your
+  // registered courses, PLUS (b) same-course supersede: a section of THIS course you're
+  // already in (the portal won't let you hold two sections of one course). Send the
+  // course title so the server can flag (b) the way auto-join does.
   const days = [...document.querySelectorAll(".dayChk:checked")].map(c => c.value);
   const r = await api("/api/alerts/clash-check", {
     method: "POST",
     body: JSON.stringify({
+      course_title: $("courseSearch").value.trim(),
       days,
       time_start: timeVal("timeStart"),
       time_end: timeVal("timeEnd"),
     }),
   });
   const considered = r.registered_considered || [];
+  const sameCourse = r.same_course || [];
   const w = r.window || {};
   const winLabel = `${(w.days && w.days.length ? w.days.map(d => d.slice(0, 3)).join("/") : "any day")} ${fmt12(w.time_start) || "start"}–${fmt12(w.time_end) || "end"}`;
   const src = `vs ${considered.length} registered course(s) from ${r.source || "?"}`;
@@ -275,8 +279,12 @@ $("checkClash").onclick = async () => {
     clearTargets();
     return;
   }
-  $("clashMsg").textContent = `⚠️ Your window (${winLabel}) overlaps: ` +
-    r.clashes.map(x => `${x.title} [${x.section}]`).join(", ") + `  (${src})`;
+  // Distinguish the two reasons so the message is accurate when a course is flagged
+  // purely because you're already in it (no time overlap).
+  const parts = [];
+  if (r.clashes.length) parts.push(`overlaps ${r.clashes.map(x => `${x.title} [${x.section}]`).join(", ")}`);
+  if (sameCourse.length) parts.push(`already registered in the same course: ${sameCourse.map(x => `${x.title} [${x.section}]`).join(", ")}`);
+  $("clashMsg").textContent = `⚠️ Your window (${winLabel}) ${parts.join("; ")}.  (${src})`;
   $("targetChecks").innerHTML = r.clash_course_titles.map(t =>
     `<label><input type="checkbox" class="tgtChk" value="${esc(t)}" checked> ${esc(t)}</label>`).join("<br>");
 };

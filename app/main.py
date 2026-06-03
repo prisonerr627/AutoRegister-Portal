@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config, db
 from .applog import log
 from .catalog import Catalog
-from .poller import _registered_sections
+from .poller import _norm, _registered_sections
 from .monitor import monitor_manager
 from .notify import discord_send
 from .portal import LoginError, NeedCaptcha
@@ -528,11 +528,22 @@ async def clash_check(payload: dict = Body(...), c: Caller = Depends(caller)):
     window_slots = [s for d in (days or WEEKDAYS) if (s := make_slot(d, start_str, end_str))]
 
     clashing = find_clashes(window_slots, registered)
-    clash_titles = sorted({x["title"] for x in clashing})
+    # Same-course supersede (mirrors poller._try_join so the preview matches what
+    # auto-join actually does): the portal forbids holding two sections of one course at
+    # once, even with NO time overlap — so a section of the alert's OWN course you're
+    # already in is a drop candidate the pure time-overlap check above can't catch.
+    # Surface it separately when the UI sends the chosen course title.
+    want = _norm(payload.get("course_title") or "")
+    clashing_ids = {id(x) for x in clashing}
+    same_course = [r for r in registered
+                   if want and _norm(r.get("title")) == want and id(r) not in clashing_ids]
+    drop_targets = clashing + same_course
+    clash_titles = sorted({x["title"] for x in drop_targets})
     return {
         "mode": "window",
         "window": {"days": days, "time_start": ts, "time_end": te},
         "clashes": [{"title": x["title"], "section": x["section"]} for x in clashing],
+        "same_course": [{"title": x["title"], "section": x["section"]} for x in same_course],
         "clash_course_titles": clash_titles,
         "source": source,
         "registered_considered": [{"title": x["title"], "section": x["section"]} for x in registered],

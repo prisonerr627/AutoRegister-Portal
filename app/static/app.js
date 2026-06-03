@@ -36,6 +36,18 @@ function renderSectionsTimer() {
 }
 setInterval(renderSectionsTimer, 1000);
 
+// Map a server "seconds remaining" into a browser-local target time, but keep the
+// existing target if it's still within 2s of the server value — so the per-second
+// ticker counts down smoothly instead of stuttering on every status poll.
+function syncCountdown(currentAt, serverSeconds) {
+  if (serverSeconds == null || serverSeconds <= 0) return null;
+  if (currentAt != null) {
+    const projected = Math.round((currentAt - Date.now()) / 1000);
+    if (Math.abs(projected - serverSeconds) <= 2) return currentAt;  // close enough; don't jolt
+  }
+  return Date.now() + serverSeconds * 1000;
+}
+
 async function refreshStatus() {
   let s; try { s = await api("/api/status"); } catch { return; }
   const reg = $("regPill");
@@ -55,18 +67,15 @@ async function refreshStatus() {
   const pp = $("proxyPill");
   pp.classList.toggle("hidden", !s.proxy);
   if (s.proxy) pp.textContent = "proxy" + (s.verify_tls ? "" : " (no TLS verify)");
-  // Re-baseline the live countdown from the server value; the 1s ticker below
-  // decrements it locally so it visibly counts down between status polls.
-  if (s.prereg_unlocks_in != null && s.prereg_unlocks_in > 0) {
-    preregUnlocksAt = Date.now() + s.prereg_unlocks_in * 1000;
-  } else {
-    preregUnlocksAt = null;
-  }
+  // Baseline the live countdown once, then let the 1s ticker run it down smoothly.
+  // Only re-sync when it first appears or the server value diverges by >2s (a real
+  // change, e.g. Select2 restarted) — re-baselining every poll made the display
+  // stutter/hang for a beat (server sends an int()-floored value + request latency).
+  preregUnlocksAt = syncCountdown(preregUnlocksAt, s.prereg_unlocks_in);
   renderPreregTimer();
 
   // Same idea for the next live section refresh (only while engaged).
-  sectionsNextAt = s.sections_next_in != null
-    ? Date.now() + s.sections_next_in * 1000 : null;
+  sectionsNextAt = syncCountdown(sectionsNextAt, s.sections_next_in);
   renderSectionsTimer();
 
   renderCatalog(s.catalog, s.logged_in);
@@ -144,7 +153,7 @@ $("refreshCatalogBtn").onclick = async () => {
   const btn = $("refreshCatalogBtn");
   catalogRefreshing = true;
   btn.disabled = true; btn.textContent = "Refreshing…";
-  $("catalogAge").textContent = "Catalog: refreshing… (~30s)";
+  $("catalogAge").textContent = "Catalog: refreshing…";
   try {
     const r = await api("/api/catalog/refresh", { method: "POST" });
     if (!r.ok) { $("catalogAge").textContent = "Catalog: refresh failed — " + (r.error || "error"); }
@@ -422,6 +431,109 @@ $("reloadSecsBtn").onclick = async () => {
   finally { b.disabled = false; b.textContent = "Reload sections"; }
 };
 
+// ─── seat monitors ──────────────────────────────────────────────────────────
+// A monitor watches one section's seat count and pings Discord on a change /
+// threshold crossing. It keeps running after the tab closes (own background loop).
+let monSearchTimer;
+$("monCourseSearch").addEventListener("input", () => {
+  clearTimeout(monSearchTimer);
+  monSearchTimer = setTimeout(async () => {
+    const { titles } = await api("/api/catalog?q=" + encodeURIComponent($("monCourseSearch").value));
+    $("monCourseList").innerHTML = titles.map(t => `<option value="${esc(t)}">`).join("");
+    if (titles.includes($("monCourseSearch").value)) loadMonitorSections();
+  }, 200);
+});
+async function loadMonitorSections() {
+  try {
+    const r = await api("/api/catalog/sections?title=" + encodeURIComponent($("monCourseSearch").value));
+    $("monSecs").textContent = r.sections.length
+      ? "Known sections: " + r.sections.map(x => `${x.section} (${x.routine})`).join("  ·  ")
+      : "No sections in the offered-course report (live seats may still be found).";
+  } catch {}
+}
+// Day chips for the new-section day/time filter (own IDs, separate from the alert form).
+$("monDayChecks").innerHTML = DAYS.map(d =>
+  `<label class="chip"><input type="checkbox" class="monDayChk" value="${d}"> ${d.slice(0,3)}</label>`).join("");
+
+// Toggle which inputs apply to the picked mode: threshold N (threshold mode),
+// day/time filter + hide the single-section step (new_section mode).
+function syncMonMode() {
+  const mode = document.querySelector('input[name="monMode"]:checked')?.value || "threshold";
+  $("monThreshold").disabled = mode !== "threshold";
+  $("monDaytime").classList.toggle("hidden", mode !== "new_section");
+  $("monSectionStep").classList.toggle("hidden", mode === "new_section");
+}
+$("monModeThreshold").onchange = syncMonMode;
+$("monModeChange").onchange = syncMonMode;
+$("monModeNew").onchange = syncMonMode;
+syncMonMode();
+
+$("createMonitor").onclick = async () => {
+  $("monError").textContent = "";
+  const title = $("monCourseSearch").value.trim();
+  const section = $("monSection").value.trim();
+  const mode = document.querySelector('input[name="monMode"]:checked')?.value || "threshold";
+  if (!title) { $("monError").textContent = "Pick a course"; return; }
+  const data = { course_title: title, mode };
+  if (mode === "new_section") {
+    data.days = [...document.querySelectorAll(".monDayChk:checked")].map(c => c.value);
+    data.time_start = timeVal("monTimeStart");
+    data.time_end = timeVal("monTimeEnd");
+  } else {
+    if (!section) { $("monError").textContent = "Enter a section label"; return; }
+    data.section_label = section;
+    if (mode === "threshold") {
+      const n = parseInt($("monThreshold").value, 10);
+      if (!n || n < 1) { $("monError").textContent = "Enter a seat number N for the threshold"; return; }
+      data.threshold = n;
+    }
+  }
+  try {
+    await api("/api/monitors", { method: "POST", body: JSON.stringify(data) });
+  } catch (e) {
+    $("monError").textContent = String(e.message || e).replace(/^\d+\s*/, "") || "Failed to create monitor";
+    return;
+  }
+  $("monSection").value = ""; $("monThreshold").value = "";
+  refreshMonitors();
+};
+
+async function refreshMonitors() {
+  let r; try { r = await api("/api/monitors"); } catch { return; }
+  const monitors = r.monitors || [];
+  $("noMonitors").style.display = monitors.length ? "none" : "block";
+  $("monitorRows").innerHTML = monitors.map(m => {
+    const checked = m.last_checked_at ? `checked ${new Date(m.last_checked_at).toLocaleTimeString()}` : "not checked yet";
+    if (m.mode === "new_section") {
+      const win = `${(m.days && m.days.length ? m.days.map(d => d.slice(0,3)).join("/") : "any day")} ${fmt12(m.time_start) || "start"}–${fmt12(m.time_end) || "end"}`;
+      const nseen = Object.keys(m.seen_sections || {}).length;
+      return `<tr>
+        <td><b>${esc(m.course_title)}</b> <span class="tag">new section</span><br>
+            <small class="muted">ping when a new section opens · ${esc(win)}</small></td>
+        <td><span class="seats">${nseen} seen</span><br>
+            <small class="muted"><span class="tag">${esc(m.status)}</span> · ${esc(checked)}</small></td>
+        <td>
+          <button class="ghost" onclick="toggleMonitor(${m.id},${m.active?0:1})">${m.active?'pause':'resume'}</button>
+          <button class="danger" onclick="delMonitor(${m.id})">×</button>
+        </td></tr>`;
+    }
+    const mode = m.mode === "threshold" ? `ping when filled < ${m.threshold}` : "ping on any change";
+    const seats = (m.last_count != null && m.last_capacity != null)
+      ? `${m.last_count}/${m.last_capacity}` : "—";
+    return `<tr>
+      <td><b>${esc(m.course_title)}</b> <span class="tag">${esc(m.section_label)}</span><br>
+          <small class="muted">${esc(mode)}</small>${m.routine ? `<br><small class="muted">${esc(m.routine)}</small>` : ""}</td>
+      <td><span class="seats">${seats}</span><br>
+          <small class="muted"><span class="tag">${esc(m.status)}</span> · ${esc(checked)}</small></td>
+      <td>
+        <button class="ghost" onclick="toggleMonitor(${m.id},${m.active?0:1})">${m.active?'pause':'resume'}</button>
+        <button class="danger" onclick="delMonitor(${m.id})">×</button>
+      </td></tr>`;
+  }).join("");
+}
+window.toggleMonitor = async (id, active) => { await api("/api/monitors/"+id, { method:"PATCH", body: JSON.stringify({active}) }); refreshMonitors(); };
+window.delMonitor = async (id) => { if(confirm("Delete monitor?")){ await api("/api/monitors/"+id,{method:"DELETE"}); refreshMonitors(); } };
+
 // ─── log ──────────────────────────────────────────────────────────────────────
 async function refreshLog() {
   let r; try { r = await api("/api/events?limit=80"); } catch { return; }
@@ -441,8 +553,9 @@ function resetOnExit() {
 window.addEventListener("pagehide", resetOnExit);
 
 // ─── loops ──────────────────────────────────────────────────────────────────
-refreshStatus(); refreshAlerts(); refreshRegisterable(); refreshLog();
+refreshStatus(); refreshAlerts(); refreshRegisterable(); refreshLog(); refreshMonitors();
 setInterval(refreshStatus, 3000);
 setInterval(refreshRegisterable, 5000);
 setInterval(refreshLog, 4000);
 setInterval(refreshAlerts, 8000);
+setInterval(refreshMonitors, 8000);

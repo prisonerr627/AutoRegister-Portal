@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from . import config, db, portal
 from .applog import log, traced
-from .notify import discord_send
+from .notify import discord_notify, discord_send
 from .portal import LoginError, NeedCaptcha
 from .schedule import (find_clashes, matches_daytime_filter, parse_routine,
                        routine_summary, schedule_gap, slots_clash)
@@ -360,7 +360,10 @@ class Engine:
             routine = routine_summary(sec.get("Routine", ""))
             db.log_event(self.user, "info", f"OPEN {title} [{label}] {seats} {routine}")
             suffix = "" if window_open else " (will auto-join when the window opens)" if alert.get("auto_join") else ""
-            await discord_send(self._dnote(f"🔔 **OPEN** {title} **[{label}]** ({seats}) — {routine}{suffix}"))
+            # Fire-and-forget: this notify loop runs BEFORE the auto-join branch below,
+            # so an awaited webhook here would delay registering the very section we're
+            # about to grab.
+            discord_notify(self._dnote(f"🔔 **OPEN** {title} **[{label}]** ({seats}) — {routine}{suffix}"))
         if new_secs:
             db.update_alert(self.user, alert["id"], {"notified_section_ids": list(notified)})
 
@@ -418,12 +421,39 @@ class Engine:
         scored.sort(key=lambda t: t[0])
         return scored[0][1]
 
+    async def _section_still_open(self, course: dict, sec: dict) -> bool:
+        """Re-fetch this course's live sections and confirm the chosen section STILL has
+        a free seat — the last check before any irreversible drop. Closes the race
+        between _evaluate_one seeing the seat free and the drop/register actually firing:
+        during the open-registration stampede the seat can vanish in the seconds since.
+        Fail-safe: if the reload errors we return False so a drop never fires on
+        unconfirmed state (better to miss the swap than be left in neither section)."""
+        sid = sec.get("ID")
+        try:
+            loaded = await self.session.load_sections(course)
+        except Exception as e:  # noqa: BLE001
+            log.warning("_try_join[%s] pre-drop re-check reload failed: %s", self.user, e)
+            return False
+        secs = (loaded.get("Data") or {}).get("RegisterableSections") or \
+            course.get("RegisterableSections", [])
+        fresh = next((s for s in secs if s.get("ID") == sid), None)
+        return bool(fresh and _section_open(fresh))
+
     @traced
     async def _try_join(self, alert, course, sec, registered, prereg):
         title = course.get("Title", alert["course_title"])
         label = sec.get("Title", "?")
         candidate_slots = parse_routine(sec.get("Routine", ""))
         clashes = find_clashes(candidate_slots, registered)
+        # Same-course supersede: the portal forbids holding two sections of the SAME
+        # course at once, even when their class times don't overlap — so find_clashes
+        # (pure time overlap) won't flag the section you're already in. Add any
+        # already-registered section of THIS very course as a clash so it becomes a
+        # drop candidate; otherwise the join just bounces off the portal's "already
+        # registered in this course" rule and the swap never happens.
+        same_course = [r for r in registered
+                       if _norm(r.get("title")) == _norm(title) and r not in clashes]
+        clashes = clashes + same_course
         log.info("_try_join[%s] %s [%s] policy=%s filter=%s clashes=%s",
                  self.user, title, label, alert.get("clash_policy"),
                  alert.get("filter_type"), [f"{c['title']} [{c['section']}]" for c in clashes])
@@ -437,28 +467,38 @@ class Engine:
             if not allow_drop:
                 msg = ", ".join(f"{c['title']} [{c['section']}]" for c in clashes)
                 db.log_event(self.user, "warn", f"{title} [{label}] clashes with {msg} — alert only")
-                await discord_send(self._dnote(f"⚠️ {title} **[{label}]** clashes with {msg} — not auto-joined."))
+                discord_notify(self._dnote(f"⚠️ {title} **[{label}]** clashes with {msg} — not auto-joined."))
                 return
             targets = {_norm(t) for t in alert.get("unregister_targets", [])}
             not_approved = [c for c in clashes if targets and _norm(c["title"]) not in targets]
             if not_approved:
                 msg = ", ".join(f"{c['title']}" for c in not_approved)
                 db.log_event(self.user, "warn", f"{title} [{label}] clashes with un-approved {msg} — skipped")
-                await discord_send(self._dnote(f"⛔ {title} **[{label}]** clashes with {msg} (not approved to drop) — skipped."))
+                discord_notify(self._dnote(f"⛔ {title} **[{label}]** clashes with {msg} (not approved to drop) — skipped."))
+                return
+            # Pre-drop re-check: the seat was free when _evaluate_one looked, but in the
+            # open-registration stampede it can vanish in the seconds since. Confirm it's
+            # STILL open right before we drop anything; if it filled, keep the existing
+            # section(s) untouched rather than dropping into nothing.
+            if not await self._section_still_open(course, sec):
+                db.log_event(self.user, "warn", f"{title} [{label}] filled before swap — kept existing section(s), nothing dropped")
+                discord_notify(self._dnote(f"🛑 **{title} [{label}]** filled up just before the swap — kept your current section, nothing dropped."))
                 return
             for c in clashes:
                 if not c.get("section_id"):
                     continue
                 res = await self.session.unregister_section(c["section_id"])
                 db.log_event(self.user, "info", f"Dropped {c['title']} [{c['section']}] -> {res.get('IsSuccess')} err={res.get('Error')}")
-                await discord_send(self._dnote(f"♻️ Dropped **{c['title']} [{c['section']}]** to free {title}."))
+                # Fire-and-forget: a webhook round-trip here would sit BETWEEN the drop
+                # and the register, widening the gap where the seat can be lost.
+                discord_notify(self._dnote(f"♻️ Dropped **{c['title']} [{c['section']}]** to free {title}."))
 
         res = await self.session.register_section(sec)
         if res.get("IsSuccess"):
             db.update_alert(self.user, alert["id"], {"status": "joined", "active": 0})
             db.log_event(self.user, "info", f"REGISTERED {title} [{label}]")
-            await discord_send(self._dnote(f"✅ **Registered** {title} **[{label}]** — {routine_summary(sec.get('Routine',''))}"))
+            discord_notify(self._dnote(f"✅ **Registered** {title} **[{label}]** — {routine_summary(sec.get('Routine',''))}"))
         else:
             err = res.get("Error") or res
             db.log_event(self.user, "error", f"Register {title} [{label}] failed: {err}")
-            await discord_send(self._dnote(f"❌ Failed to register {title} [{label}]: {err}"))
+            discord_notify(self._dnote(f"❌ Failed to register {title} [{label}]: {err}"))

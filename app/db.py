@@ -88,8 +88,59 @@ def _init(c: sqlite3.Connection) -> None:
             level TEXT NOT NULL,
             message TEXT NOT NULL
         );
+        -- ─── seat-fill Monitors (separate, always-on feature) ──────────────
+        -- Distinct from `alerts`: monitors watch a section's seat COUNT and ping
+        -- Discord on a change/threshold crossing, and KEEP RUNNING after the
+        -- dashboard tab closes. So their creds/cookies live in their OWN table
+        -- (monitor_users) that the dashboard idle-wipe (users.py:_wipe) never
+        -- touches. Created with IF NOT EXISTS and WITHOUT bumping _SCHEMA_VERSION
+        -- so they survive the multi-user migration wipe untouched.
+        CREATE TABLE IF NOT EXISTS monitors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            course_title TEXT NOT NULL,
+            course_code TEXT,
+            section_label TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'change',   -- 'threshold' | 'change' | 'new_section'
+            threshold INTEGER,                      -- seat count N (mode='threshold')
+            -- new_section mode: a day/time filter (mirrors `alerts`); a freshly-opened
+            -- section only notifies when EVERY slot falls on an allowed day & window.
+            days TEXT NOT NULL DEFAULT '[]',
+            time_start TEXT,
+            time_end TEXT,
+            -- new_section mode bookkeeping: JSON {section_label: had_open_seat(bool)} of
+            -- every matching section seen so far, so we can tell a brand-new label (or a
+            -- previously-full section that just re-opened) from the steady state.
+            seen_sections TEXT NOT NULL DEFAULT '{}',
+            last_count INTEGER,
+            last_capacity INTEGER,
+            armed INTEGER NOT NULL DEFAULT 1,       -- threshold edge-trigger re-arm flag
+            active INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'watching',
+            created_at TEXT NOT NULL,
+            last_checked_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS monitor_users (
+            username TEXT PRIMARY KEY,
+            password TEXT,
+            cookies TEXT,
+            display_name TEXT,
+            created_at TEXT NOT NULL
+        );
         """
     )
+    # Additive migration: the new_section-mode columns were added to `monitors` after
+    # the table first shipped, and `monitors` is created WITHOUT IF-version-bumping
+    # (it survives the multi-user wipe), so an existing DB won't have them yet.
+    have = {r["name"] for r in c.execute("PRAGMA table_info(monitors)").fetchall()}
+    for col, ddl in (
+        ("days", "days TEXT NOT NULL DEFAULT '[]'"),
+        ("time_start", "time_start TEXT"),
+        ("time_end", "time_end TEXT"),
+        ("seen_sections", "seen_sections TEXT NOT NULL DEFAULT '{}'"),
+    ):
+        if col not in have:
+            c.execute(f"ALTER TABLE monitors ADD COLUMN {ddl}")
     c.commit()
 
 
@@ -324,3 +375,171 @@ def clear_alerts(user: str) -> int:
         cur = conn().execute("DELETE FROM alerts WHERE user=?", (user,))
         conn().commit()
         return cur.rowcount
+
+
+# ─── seat-fill monitors (per user) ─────────────────────────────────────────
+
+def _row_to_monitor(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["armed"] = bool(d["armed"])
+    d["active"] = bool(d["active"])
+    try:
+        d["days"] = json.loads(d.get("days") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        d["days"] = []
+    try:
+        d["seen_sections"] = json.loads(d.get("seen_sections") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        d["seen_sections"] = {}
+    return d
+
+
+def list_monitors(user: Optional[str] = None, active_only: bool = False) -> list[dict]:
+    """List monitors for one user, or (user=None) across ALL users — the latter is
+    what the background loop uses to fan out per-username."""
+    q = "SELECT * FROM monitors"
+    where, args = [], []
+    if user is not None:
+        where.append("username=?"); args.append(user)
+    if active_only:
+        where.append("active=1")
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY id"
+    with _LOCK:
+        rows = conn().execute(q, tuple(args)).fetchall()
+    return [_row_to_monitor(r) for r in rows]
+
+
+def get_monitor(monitor_id: int, user: Optional[str] = None) -> Optional[dict]:
+    q = "SELECT * FROM monitors WHERE id=?"
+    args: list = [monitor_id]
+    if user is not None:
+        q += " AND username=?"; args.append(user)
+    with _LOCK:
+        row = conn().execute(q, tuple(args)).fetchone()
+    return _row_to_monitor(row) if row else None
+
+
+def create_monitor(user: str, data: dict) -> dict:
+    fields = {
+        "username": user,
+        "course_title": data["course_title"],
+        "course_code": data.get("course_code"),
+        "section_label": data["section_label"],
+        "mode": data.get("mode", "change"),
+        "threshold": data.get("threshold"),
+        "days": json.dumps(data.get("days", [])),
+        "time_start": data.get("time_start"),
+        "time_end": data.get("time_end"),
+        "seen_sections": "{}",
+        "last_count": None,
+        "last_capacity": None,
+        "armed": 1,
+        "active": 1 if data.get("active", True) else 0,
+        "status": "watching",
+        "created_at": _now(),
+        "last_checked_at": None,
+    }
+    cols = ",".join(fields)
+    placeholders = ",".join("?" for _ in fields)
+    with _LOCK:
+        cur = conn().execute(
+            f"INSERT INTO monitors({cols}) VALUES({placeholders})", tuple(fields.values())
+        )
+        conn().commit()
+        new_id = cur.lastrowid
+    from .applog import log
+    log.info("create_monitor[%s] #%s %s [%s] mode=%s threshold=%s",
+             user, new_id, data.get("course_title"), data.get("section_label"),
+             data.get("mode"), data.get("threshold"))
+    return get_monitor(new_id, user)
+
+
+def update_monitor(monitor_id: int, data: dict, user: Optional[str] = None) -> Optional[dict]:
+    allowed = {
+        "course_title", "course_code", "section_label", "mode", "threshold",
+        "days", "time_start", "time_end", "seen_sections",
+        "last_count", "last_capacity", "armed", "active", "status", "last_checked_at",
+    }
+    sets, vals = [], []
+    for k, v in data.items():
+        if k not in allowed:
+            continue
+        if k in ("armed", "active"):
+            v = 1 if v else 0
+        elif k in ("days", "seen_sections") and not isinstance(v, str):
+            v = json.dumps(v)
+        sets.append(f"{k}=?")
+        vals.append(v)
+    if sets:
+        q = f"UPDATE monitors SET {','.join(sets)} WHERE id=?"
+        vals.append(monitor_id)
+        if user is not None:
+            q += " AND username=?"; vals.append(user)
+        with _LOCK:
+            conn().execute(q, tuple(vals))
+            conn().commit()
+    return get_monitor(monitor_id, user)
+
+
+def delete_monitor(monitor_id: int, user: Optional[str] = None) -> None:
+    q = "DELETE FROM monitors WHERE id=?"
+    args: list = [monitor_id]
+    if user is not None:
+        q += " AND username=?"; args.append(user)
+    with _LOCK:
+        conn().execute(q, tuple(args))
+        conn().commit()
+
+
+def clear_monitors(user: str) -> int:
+    with _LOCK:
+        cur = conn().execute("DELETE FROM monitors WHERE username=?", (user,))
+        conn().commit()
+        return cur.rowcount
+
+
+# ─── monitor credentials/cookies (durable, separate from `users`/`meta`) ────
+
+def set_monitor_user(username: str, password: Optional[str] = None,
+                     cookies: Any = None, display_name: Optional[str] = None) -> None:
+    """Upsert the monitor's durable session store. Only the non-None arguments are
+    written, so a cookie-rotation save doesn't clobber the password/display name."""
+    cols = ["username", "created_at"]
+    vals: list = [username, _now()]
+    if password is not None:
+        cols.append("password"); vals.append(password)
+    if cookies is not None:
+        cols.append("cookies"); vals.append(json.dumps(cookies))
+    if display_name is not None:
+        cols.append("display_name"); vals.append(display_name)
+    updatable = [c for c in cols if c not in ("username", "created_at")]
+    placeholders = ",".join("?" for _ in cols)
+    set_clause = ",".join(f"{c}=excluded.{c}" for c in updatable) or "username=excluded.username"
+    with _LOCK:
+        conn().execute(
+            f"INSERT INTO monitor_users({','.join(cols)}) VALUES({placeholders}) "
+            f"ON CONFLICT(username) DO UPDATE SET {set_clause}",
+            tuple(vals),
+        )
+        conn().commit()
+
+
+def get_monitor_user(username: str) -> Optional[dict]:
+    with _LOCK:
+        row = conn().execute("SELECT * FROM monitor_users WHERE username=?", (username,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["cookies"] = json.loads(d["cookies"]) if d.get("cookies") else {}
+    except (json.JSONDecodeError, TypeError):
+        d["cookies"] = {}
+    return d
+
+
+def delete_monitor_user(username: str) -> None:
+    with _LOCK:
+        conn().execute("DELETE FROM monitor_users WHERE username=?", (username,))
+        conn().commit()

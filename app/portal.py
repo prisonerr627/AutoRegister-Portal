@@ -37,13 +37,16 @@ _REG_COURSE_RE = re.compile(r"^\s*(\d+)\s*-\s*(.+?)\s*\[([^\]]+)\]\s*$")
 # *summary* (with real class times) is only reachable via /Student/Registration?q=
 # <token>, which the /Student dashboard always exposes (window open or closed).
 _REG_Q_RE = re.compile(r"/Student/Registration\?q=[^\"'<>\s]+")
-# The "Offered Course Report" xlsx is downloadable live (so the catalog never goes
-# stale per semester). The Download button on /Student/Section/Offered?q=<token>
-# points at /Common/Section/DownloadOfferedReport (no q token needed; the portal
-# generates the xlsx server-side, ~30s). We hit that path directly, scraping the
-# real href off the Offered page only as a fallback.
+# The Offered-Sections page (/Student/Section/Offered?q=<token>, token lives on the
+# /Student dashboard) renders every section inline with live seat counts AND timing —
+# the single source for both the seat Monitors and the course/section catalog picker
+# (replacing the old slow ~30s xlsx download).
 _OFFERED_Q_RE = re.compile(r"/Student/Section/Offered\?q=[^\"'<>\s]+")
-_DOWNLOAD_REPORT_RE = re.compile(r"/Common/Section/DownloadOfferedReport[^\"'<>\s]*")
+# The Offered page renders every section's row title as "<COURSE TITLE> [<SECTION>]"
+# — and a course title may itself embed a bracket ("PRINCIPLES OF ACCOUNTING [MBA]
+# [A]"), so the SECTION is the LAST bracketed token and the course is everything
+# before it (matching the catalog picker's titles exactly, verified live 2026-06-01).
+_LAST_BRACKET_RE = re.compile(r"^(.*)\[([^\[\]]+)\]\s*$")
 _REG_TIME_RE = re.compile(
     r"\((?P<type>[^)]*)\)\s*Time:\s*"
     r"(?P<d1>[A-Za-z]{3,})\s+(?P<t1>\d{1,2}:\d{1,2})\s*(?P<ap1>AM|PM)?\s*-\s*"
@@ -114,10 +117,17 @@ def _scrape_student(html: str) -> dict:
 
 
 class PortalSession:
-    def __init__(self, username: str):
+    def __init__(self, username: str, store: str = "user"):
         # The AIUB username is this session's user key (one PortalSession per user).
         self.user = (username or "").strip()
         self.username = self.user
+        # Where credentials + the cookie jar are persisted. "user" (default) uses the
+        # dashboard's `users` table + `meta["cookies"]` — wiped when the browser tab
+        # closes. "monitor" uses the durable `monitor_users` table so the always-on
+        # seat-fill Monitors keep their own login that the dashboard idle-wipe never
+        # touches. All login / cookie-rotation / single-session / re-login logic below
+        # is shared between both stores.
+        self.store = store
         self.password = ""
         self.cookies: dict[str, str] = {}
         self.display_name = ""
@@ -132,6 +142,14 @@ class PortalSession:
 
     # ─── credentials ─────────────────────────────────────────────────────
     def _load_credentials(self) -> None:
+        if self.store == "monitor":
+            u = db.get_monitor_user(self.user)
+            if u:
+                if u.get("password"):
+                    self.password = u["password"]
+                if u.get("display_name"):
+                    self.display_name = u["display_name"]
+            return
         u = db.get_user(self.user)
         if u and u.get("password"):
             self.password = u["password"]
@@ -139,26 +157,39 @@ class PortalSession:
     def set_credentials(self, username: str, password: str) -> None:
         # username is fixed to this context's user key; only the password varies.
         self.password = password or ""
-        db.set_user(self.user, self.password)
+        if self.store == "monitor":
+            db.set_monitor_user(self.user, password=self.password)
+        else:
+            db.set_user(self.user, self.password)
 
     def clear_credentials(self) -> None:
         self.password = ""
         self.logged_in = False
         self.display_name = ""
         self.cookies = {}
-        self._save_cookies()
-        db.delete_user(self.user)
+        if self.store == "monitor":
+            db.delete_monitor_user(self.user)
+        else:
+            self._save_cookies()
+            db.delete_user(self.user)
 
     def has_credentials(self) -> bool:
         return bool(self.username and self.password)
 
-    # ─── cookie persistence (per user, in DB meta) ───────────────────────
+    # ─── cookie persistence (per user) ───────────────────────────────────
     def _load_cookies(self) -> None:
-        self.cookies = db.get_meta(self.user, "cookies", {}) or {}
+        if self.store == "monitor":
+            u = db.get_monitor_user(self.user)
+            self.cookies = (u or {}).get("cookies", {}) or {}
+        else:
+            self.cookies = db.get_meta(self.user, "cookies", {}) or {}
         self.logged_in = bool(self.cookies.get("NAABSUMSMVCFORMSAUTH"))
 
     def _save_cookies(self) -> None:
-        db.set_meta(self.user, "cookies", self.cookies)
+        if self.store == "monitor":
+            db.set_monitor_user(self.user, cookies=self.cookies)
+        else:
+            db.set_meta(self.user, "cookies", self.cookies)
 
     def _merge(self, resp: httpx.Response) -> None:
         new = dict(resp.cookies)
@@ -265,6 +296,8 @@ class PortalSession:
             name = _scrape_student(html).get("Name", "")
             if name:
                 self.display_name = name
+                if self.store == "monitor":
+                    db.set_monitor_user(self.user, display_name=name)
         if not self.logged_in:
             raise LoginError("login did not yield an auth cookie")
         self.login_count += 1
@@ -558,35 +591,99 @@ class PortalSession:
                                        referer=f"{PORTAL}/Student/Registration/Select2")
         return {"status": resp.status_code, "text": resp.text[:500]}
 
-    # ─── offered-course report (live catalog xlsx) ────────────────────────
+    # ─── offered-sections live seat counts + catalog (one page, no xlsx) ──
     @staticmethod
-    def _is_xlsx(body: bytes) -> bool:
-        # .xlsx is a zip archive — magic bytes "PK\x03\x04".
-        return body[:4] == b"PK\x03\x04"
+    def _parse_offered_sections(html: str, course: str = "") -> list[dict]:
+        """Parse live per-section seat counts out of the Offered-Sections page
+        (/Student/Section/Offered). Returns [{"course","section","filled","capacity",
+        "title"}] — `filled` is the enrolled "Count", `capacity` the "Capcity" (sic).
+
+        The page renders ONE master table (header: Class ID · Title · Status · Capcity ·
+        Count · Time) listing every section inline; each Time cell embeds nested time
+        tables, so we read only the master table's DIRECT-CHILD rows/cells. The section
+        label is the LAST bracketed token of the Title and the course is the text before
+        it. Pass `course` (case-insensitive) to keep only that course's sections; ""
+        returns all. Verified live 2026-06-01 (probe_offered_search.py)."""
+        soup = BeautifulSoup(html, "lxml")
+        # Master table = the one whose header carries both "Count" and a "Cap..." column.
+        master = None
+        for t in soup.find_all("table"):
+            heads = [th.get_text(strip=True) for th in t.find_all("th")]
+            if "Count" in heads and any(h.startswith("Cap") for h in heads):
+                master = (t, heads)
+                break
+        if master is None:
+            return []
+        table, heads = master
+        title_i = heads.index("Title")
+        count_i = heads.index("Count")
+        cap_i = next(i for i, h in enumerate(heads) if h.startswith("Cap"))
+        time_i = heads.index("Time") if "Time" in heads else -1
+        want = " ".join((course or "").split()).strip().lower()
+
+        out: list[dict] = []
+        need = max(title_i, count_i, cap_i, time_i)
+        for tr in table.find_all("tr", recursive=False):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) <= need:  # header row / malformed
+                continue
+            title = tds[title_i].get_text(" ", strip=True)
+            m = _LAST_BRACKET_RE.match(title)
+            if not m:
+                continue
+            row_course = " ".join(m.group(1).split()).strip()
+            section = m.group(2).strip()
+            if want and row_course.lower() != want:
+                continue
+            try:
+                filled = int(tds[count_i].get_text(strip=True))
+                capacity = int(tds[cap_i].get_text(strip=True))
+            except (ValueError, TypeError):
+                continue
+            # The Time cell embeds a nested table of "<type> <day> <start> <end> <room>"
+            # slot rows (same layout the catalog parses). Pull it so the new-section
+            # Monitor can day/time-filter without consulting the catalog.
+            slots: list = []
+            if time_i >= 0:
+                nested = tds[time_i].find("table")
+                if nested:
+                    for r in nested.find_all("tr"):
+                        cells = [c.get_text(" ", strip=True) for c in r.find_all("td")]
+                        if len(cells) < 4:
+                            continue
+                        slot = make_slot(cells[1], cells[2], cells[3], cells[0],
+                                         cells[4] if len(cells) > 4 else "")
+                        if slot:
+                            slots.append(slot)
+            out.append({"course": row_course, "section": section,
+                        "filled": filled, "capacity": capacity, "title": title,
+                        "slots": slots})
+        return out
 
     @traced
-    async def download_offered_report(self) -> bytes:
-        """Download the portal's live 'Offered Course Report.xlsx' and return the raw
-        bytes (same format catalog.py already parses). Needs only a valid session — the
-        Download link carries no q token. The portal builds the file on the fly (~30s),
-        so this uses a long timeout. Fast path hits /Common/Section/DownloadOfferedReport
-        directly; if that ever stops returning an xlsx we scrape the real Download href
-        off the Offered page (which itself needs the dashboard's q token).
+    async def offered_sections(self, course: str = "") -> list[dict]:
+        """Read live seat counts per section from the portal's Offered-Sections page
+        (/Student/Section/Offered) WITHOUT entering the registration workspace — so it
+        sidesteps the Select2 ~49s server timer and is safe on the always-on Monitors
+        cadence. The page lists EVERY section inline (no search submit / ajax needed);
+        we just GET it and parse the master table. Returns [{"course","section",
+        "filled","capacity","title"}], filtered to `course` when given (else all).
 
-        ⚠️ The portal serializes ALL requests within a session server-side (ASP.NET
-        session lock), so this ~30s call freezes the poller regardless of how we issue
-        it — callers MUST gate it off the open window / force-flow (see maybe_refresh_
-        catalog) rather than rely on a client-side trick."""
-        async with self._lock:
-            resp = await self._request(
-                "GET", "/Common/Section/DownloadOfferedReport",
-                referer=f"{PORTAL}/Student", timeout=180.0,
-            )
-        if resp.status_code == 200 and self._is_xlsx(resp.content):
-            return resp.content
+        Flow: GET /Student → scrape the Offered page's q token (reuse _OFFERED_Q_RE) →
+        GET /Student/Section/Offered?q=<token> → parse. (~1.3 MB page; the monitor
+        fetches it once per user per cycle and matches all that user's monitors against
+        the result.)"""
+        html = await self.offered_html()
+        sections = self._parse_offered_sections(html, course)
+        log.info("offered_sections[%s] course=%r -> %d section(s)",
+                 self.user, course or "(all)", len(sections))
+        return sections
 
-        # Fallback: discover the Offered page (q token lives on the dashboard), then
-        # scrape its Download href and follow that.
+    async def offered_html(self) -> str:
+        """Fetch the raw Offered-Sections page HTML (GET /Student → scrape the
+        /Student/Section/Offered?q=<token> link → GET it). Shared by offered_sections()
+        (live seat counts) and the catalog refresh (course/section/timing picker) — both
+        parse this one ~1.3 MB page instead of the slow ~30s xlsx download."""
         async with self._lock:
             home = await self._request("GET", "/Student", referer=f"{PORTAL}/")
         qm = _OFFERED_Q_RE.search(home.text)
@@ -594,16 +691,4 @@ class PortalSession:
             raise LoginError("could not find the Offered-courses link on the dashboard")
         async with self._lock:
             page = await self._request("GET", qm.group(0), referer=f"{PORTAL}/Student")
-        dm = _DOWNLOAD_REPORT_RE.search(page.text)
-        if not dm:
-            raise LoginError("could not find the Download link on the Offered-courses page")
-        async with self._lock:
-            resp = await self._request(
-                "GET", dm.group(0), referer=f"{PORTAL}{qm.group(0)}", timeout=180.0,
-            )
-        if resp.status_code == 200 and self._is_xlsx(resp.content):
-            return resp.content
-        raise LoginError(
-            f"Offered report download did not return an xlsx "
-            f"(status={resp.status_code}, content-type={resp.headers.get('content-type','')})"
-        )
+        return page.text

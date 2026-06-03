@@ -8,6 +8,7 @@ resumed on startup.
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -22,6 +23,8 @@ from . import config, db
 from .applog import log
 from .catalog import Catalog
 from .poller import _registered_sections
+from .monitor import monitor_manager
+from .notify import discord_send
 from .portal import LoginError, NeedCaptcha
 from .schedule import WEEKDAYS, find_clashes, make_slot, parse_time_to_minutes
 from .users import UserContext, manager
@@ -34,9 +37,15 @@ _catalog_refreshing = False
 
 
 def _catalog_path() -> Path:
-    """The live override (downloaded from the portal) if present, else the bundled
-    seed shipped with the app."""
+    """The active catalog file: the live JSON cache (parsed from the Offered page) if
+    present, else the legacy xlsx override, else the bundled seed shipped with the app."""
+    if config.CATALOG_CACHE.exists():
+        return config.CATALOG_CACHE
     return config.CATALOG_OVERRIDE if config.CATALOG_OVERRIDE.exists() else config.CATALOG_XLSX
+
+
+def _catalog_is_live() -> bool:
+    return config.CATALOG_CACHE.exists() or config.CATALOG_OVERRIDE.exists()
 
 
 def _catalog_age_seconds() -> Optional[float]:
@@ -54,16 +63,20 @@ def _catalog_info() -> dict:
         "count": len(catalog.titles()) if catalog else 0,
         "age_seconds": round(age) if age is not None else None,
         "refreshing": _catalog_refreshing,
-        "source": "live" if config.CATALOG_OVERRIDE.exists() else "bundled",
+        "source": "live" if _catalog_is_live() else "bundled",
     }
 
 
 def _load_catalog() -> None:
-    """(Re)load the global catalog from whichever file is active."""
+    """(Re)load the global catalog from whichever file is active: the live JSON cache
+    (Offered-page parse), else a legacy xlsx (override or bundled seed)."""
     global catalog
     path = _catalog_path()
     try:
-        catalog = Catalog.load(path)
+        if path.suffix == ".json":
+            catalog = Catalog(json.loads(path.read_text(encoding="utf-8")))
+        else:
+            catalog = Catalog.load(path)
         log.info("loaded catalog: %d courses from %s", len(catalog.titles()), path)
     except Exception as e:  # noqa: BLE001
         if catalog is None:
@@ -72,20 +85,24 @@ def _load_catalog() -> None:
 
 
 async def refresh_catalog(session) -> dict:
-    """Download the live Offered Course Report via a logged-in portal session, persist
-    it as the override, and rebuild the global catalog. Returns {ok, count, error}."""
+    """Rebuild the catalog from the live Offered-Sections page (GET /Student/Section/
+    Offered?q=…) via a logged-in session, persist it as the JSON cache, and reload the
+    global catalog. Replaces the old ~30s DownloadOfferedReport xlsx path. Returns
+    {ok, count, error}."""
     global _catalog_refreshing
     async with _catalog_lock:
         _catalog_refreshing = True
         try:
-            data = await session.download_offered_report()
-            tmp = config.CATALOG_OVERRIDE.with_suffix(".xlsx.tmp")
-            tmp.write_bytes(data)
-            # Validate it parses before promoting it over the current catalog.
-            n = len(Catalog.load(tmp).titles())
-            tmp.replace(config.CATALOG_OVERRIDE)
+            html = await session.offered_html()
+            cat = Catalog.from_offered_html(html)
+            n = len(cat.titles())
+            if n == 0:
+                raise ValueError("offered page parsed to 0 courses")
+            tmp = config.CATALOG_CACHE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(cat.courses), encoding="utf-8")
+            tmp.replace(config.CATALOG_CACHE)
             _load_catalog()
-            log.info("catalog refreshed from portal: %d courses (%d bytes)", n, len(data))
+            log.info("catalog refreshed from Offered page: %d courses", n)
             return {"ok": True, "count": n}
         except Exception as e:  # noqa: BLE001
             log.exception("catalog refresh failed: %s", e)
@@ -98,10 +115,10 @@ def maybe_refresh_catalog(session) -> None:
     """Fire a background catalog refresh if the active file is stale (older than
     CATALOG_MAX_AGE_HOURS) and one isn't already running. Non-blocking.
 
-    GATED off the live registration flow: the portal serialises every request within a
-    session server-side (ASP.NET session lock), so the ~30s download would freeze the
-    poller/force-flow no matter how we issue it. We therefore skip the auto-refresh
-    while registration is open or force-flow is on (those are the poller's 'engaged'
+    Still GATED off the live registration flow: the portal serialises every request
+    within a session server-side (ASP.NET session lock), so even the quick (~2.5s)
+    Offered-page fetch would briefly stall the poller/force-flow. We skip the
+    auto-refresh while registration is open or force-flow is on (the poller's 'engaged'
     states) — the catalog isn't time-critical, and the manual button is always there."""
     if _catalog_refreshing:
         return
@@ -123,10 +140,12 @@ async def lifespan(app: FastAPI):
     _load_catalog()
     await manager.resume_all()
     reaper = asyncio.create_task(_idle_reaper())
-    log.info("lifespan: startup complete (idle reaper started)")
+    monitor_manager.start()
+    log.info("lifespan: startup complete (idle reaper + monitor loop started)")
     yield
     log.info("lifespan: shutdown begin")
     reaper.cancel()
+    await monitor_manager.stop()
     await manager.stop_all()
     log.info("lifespan: shutdown complete")
 
@@ -309,6 +328,15 @@ async def reset_dashboard(c: Caller = Depends(caller)):
 
 @app.post("/api/logout", dependencies=[Depends(require_auth)])
 async def logout(c: Caller = Depends(caller)):
+    # Explicit log out honours "clear stored credentials": unlike the idle browser-close
+    # wipe (which deliberately leaves Monitors running in the background), it also forgets
+    # this user's seat-fill Monitors and their durable monitor credentials.
+    username = db.user_for_sid(c.sid)
+    if username:
+        n = db.clear_monitors(username)
+        db.delete_monitor_user(username)
+        if n:
+            db.log_event(username, "info", f"Log out: also removed {n} seat-fill monitor(s)")
     await manager.logout(c.sid)
     return {"ok": True}
 
@@ -427,9 +455,8 @@ async def catalog_sections(title: str):
 
 @app.post("/api/catalog/refresh", dependencies=[Depends(require_auth)])
 async def catalog_refresh(c: Caller = Depends(caller)):
-    """Download the latest Offered Course Report from the portal (using the caller's
-    logged-in session) and rebuild the global catalog. Blocks ~30s while the portal
-    generates the file."""
+    """Rebuild the catalog live from the portal's Offered-Sections page (using the
+    caller's logged-in session). Fast (~2.5s) — replaces the old ~30s xlsx download."""
     ctx = _ctx(c)
     if not ctx.session.logged_in:
         return JSONResponse({"ok": False, "error": "log in first"}, status_code=200)
@@ -510,6 +537,111 @@ async def clash_check(payload: dict = Body(...), c: Caller = Depends(caller)):
         "source": source,
         "registered_considered": [{"title": x["title"], "section": x["section"]} for x in registered],
     }
+
+
+# ─── seat-fill monitors CRUD ───────────────────────────────────────────────────
+@app.get("/api/monitors", dependencies=[Depends(require_auth)])
+async def get_monitors(c: Caller = Depends(caller)):
+    if not c.ctx:
+        return {"monitors": []}
+    monitors = db.list_monitors(c.ctx.username)
+    for m in monitors:
+        routine = ""
+        if catalog:
+            entry = catalog.get(m["course_title"])
+            if entry:
+                sec = entry["sections"].get(m["section_label"])
+                if sec:
+                    routine = " & ".join(
+                        f"{s['day'][:3]} {s['start']//60:02d}:{s['start']%60:02d}-{s['end']//60:02d}:{s['end']%60:02d}"
+                        for s in sec["slots"]
+                    )
+        m["routine"] = routine
+    return {"monitors": monitors}
+
+
+@app.post("/api/monitors", dependencies=[Depends(require_auth)])
+async def add_monitor(data: dict = Body(...), c: Caller = Depends(caller)):
+    """Create a seat-fill monitor and arm its durable credential store so it keeps
+    running after the dashboard tab closes. Requires a logged-in session (so we can
+    capture the password + cookies for the background loop's own session)."""
+    ctx = _ctx(c)
+    sess = ctx.session
+    if not (sess.logged_in and sess.has_credentials()):
+        raise HTTPException(400, "log in first so the monitor can keep your session alive")
+    if not data.get("course_title"):
+        raise HTTPException(400, "course_title required")
+    mode = data.get("mode", "change")
+    if mode not in ("threshold", "change", "new_section"):
+        raise HTTPException(400, "mode must be 'threshold', 'change' or 'new_section'")
+    # new_section watches a whole COURSE (any matching label), so it needs no specific
+    # section; the others watch one named section.
+    if mode != "new_section" and not data.get("section_label"):
+        raise HTTPException(400, "section_label required")
+    threshold = data.get("threshold")
+    if mode == "threshold":
+        try:
+            threshold = int(threshold)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "threshold (a seat number) is required for threshold mode")
+    else:
+        threshold = None
+    days = data.get("days") or [] if mode == "new_section" else []
+    time_start = data.get("time_start") if mode == "new_section" else None
+    time_end = data.get("time_end") if mode == "new_section" else None
+    u = ctx.username
+    # Arm the durable store: copy the live session's password + current cookie jar so
+    # the background loop can log in independently once the dashboard closes.
+    db.set_monitor_user(u, password=sess.password, cookies=sess.cookies,
+                        display_name=sess.display_name or None)
+    mon = db.create_monitor(u, {
+        "course_title": data["course_title"],
+        "course_code": data.get("course_code"),
+        "section_label": str(data.get("section_label") or "*").strip(),
+        "mode": mode,
+        "threshold": threshold,
+        "days": days,
+        "time_start": time_start,
+        "time_end": time_end,
+    })
+    if mode == "new_section":
+        win = (f"{'/'.join(d[:3] for d in days) if days else 'any day'} "
+               f"{time_start or 'start'}–{time_end or 'end'}")
+        desc = f"new section · {win}"
+    else:
+        desc = "below " + str(threshold) if mode == "threshold" else "any change"
+    db.log_event(u, "info",
+                 f"🪑 Monitor created: {mon['course_title']} "
+                 f"[{mon['section_label']}] ({desc})")
+    return mon
+
+
+@app.patch("/api/monitors/{monitor_id}", dependencies=[Depends(require_auth)])
+async def patch_monitor(monitor_id: int, data: dict = Body(...), c: Caller = Depends(caller)):
+    u = _ctx(c).username
+    # Capture the prior active state so we can Discord-alert on a genuine toggle.
+    prev = db.get_monitor(monitor_id, user=u)
+    m = db.update_monitor(monitor_id, data, user=u)
+    if not m:
+        raise HTTPException(404, "not found")
+    if "active" in data and prev is not None and bool(prev["active"]) != bool(m["active"]):
+        verb = "turned ON" if m["active"] else "turned OFF"
+        msg = (f"🪑 Monitor {verb}: {m['course_title']} [{m['section_label']}]")
+        tag = (c.ctx.session.display_name
+               or (db.get_monitor_user(u) or {}).get("display_name") or u)
+        await discord_send(f"[{tag}] {msg}")
+        db.log_event(u, "info", msg)
+    return m
+
+
+@app.delete("/api/monitors/{monitor_id}", dependencies=[Depends(require_auth)])
+async def remove_monitor(monitor_id: int, c: Caller = Depends(caller)):
+    u = _ctx(c).username
+    db.delete_monitor(monitor_id, user=u)
+    # When the last monitor goes, forget the durable monitor credentials too.
+    if not db.list_monitors(u):
+        db.delete_monitor_user(u)
+    return {"ok": True}
 
 
 @app.get("/api/events", dependencies=[Depends(require_auth)])

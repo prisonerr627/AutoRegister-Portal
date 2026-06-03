@@ -55,7 +55,7 @@
         <h2>Create alert</h2>
         <div class="row">
           <span id="catalogAge" class="muted" title="Age of the offered-course catalog used by the picker below"></span>
-          <button id="refreshCatalogBtn" class="ghost" title="Download the latest Offered Course Report from the portal (~30s)">Refresh catalog</button>
+          <button id="refreshCatalogBtn" class="ghost" title="Refresh the offered-course list live from the portal">Refresh catalog</button>
         </div>
       </div>
       <small class="hint">Watch a course and get a Discord ping — and optionally auto-join — the moment a matching section opens.</small>
@@ -139,6 +139,66 @@
       <h2>Alerts</h2>
       <table><tbody id="alertRows"></tbody></table>
       <p id="noAlerts" class="muted">No alerts yet.</p>
+    </div>
+  </div>
+
+  <!-- SEAT MONITORS -->
+  <div class="grid2">
+    <div class="panel">
+      <h2>Create seat monitor</h2>
+      <small class="hint">Watch a section's seat count — or a whole course for a <b>brand-new section</b> opening at a time you want. Unlike alerts above, monitors <b>keep running after you close this tab</b> — and don't need the registration window open.</small>
+
+      <!-- 1 · Course -->
+      <div class="step">
+        <div class="step-h"><span class="n">1</span> Course</div>
+        <input id="monCourseSearch" class="fw" placeholder="type to search offered courses…" list="monCourseList" />
+        <datalist id="monCourseList"></datalist>
+      </div>
+
+      <!-- 2 · Section (hidden in new-section mode — it watches the whole course) -->
+      <div class="step" id="monSectionStep">
+        <div class="step-h"><span class="n">2</span> Section</div>
+        <input id="monSection" placeholder="section label, e.g. A" />
+        <small id="monSecs" class="hint"></small>
+      </div>
+
+      <!-- 3 · When to ping -->
+      <div class="step">
+        <div class="step-h"><span class="n">3</span> When to ping</div>
+        <label class="opt"><input type="radio" name="monMode" value="threshold" id="monModeThreshold" checked />
+          <span><b>Alert when filled seats drop below</b>
+            <input type="number" id="monThreshold" min="1" style="width:70px" placeholder="N" />
+            <small class="hint">— set N to the capacity to ping the moment it's no longer full</small></span></label>
+        <label class="opt" style="margin-top:8px"><input type="radio" name="monMode" value="change" id="monModeChange" />
+          <span><b>Alert on every seat change</b> <small class="hint">— any change, up or down</small></span></label>
+        <label class="opt" style="margin-top:8px"><input type="radio" name="monMode" value="new_section" id="monModeNew" />
+          <span><b>Alert when a NEW section opens</b> <small class="hint">— a never-seen section at the time below, or one that was full freeing a seat</small></span></label>
+
+        <div id="monDaytime" class="hidden" style="margin-top:10px">
+          <div class="field"><label>Days <small class="hint">(none = any day)</small></label>
+            <div id="monDayChecks" class="chips"></div>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div class="field"><label>From <small class="hint">(blank = start of day)</small></label>
+              <input type="time" id="monTimeStart" step="600" />
+            </div>
+            <div class="field"><label>To <small class="hint">(blank = end of day)</small></label>
+              <input type="time" id="monTimeEnd" step="600" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="monError" class="warn" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:18px">
+        <button id="createMonitor">Create monitor</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Monitors</h2>
+      <table><tbody id="monitorRows"></tbody></table>
+      <p id="noMonitors" class="muted">No monitors yet.</p>
     </div>
   </div>
 

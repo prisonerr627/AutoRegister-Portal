@@ -42,7 +42,7 @@ OPENROUTER_MODELS = [
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 
-POLL_INTERVAL_CLOSED = _int("POLL_INTERVAL_CLOSED", 20)
+POLL_INTERVAL_CLOSED = _int("POLL_INTERVAL_CLOSED", 1)
 POLL_INTERVAL_OPEN = _int("POLL_INTERVAL_OPEN", 1)
 KEEPALIVE_SECONDS = _int("KEEPALIVE_SECONDS", 240)
 # Mandatory server-side delay between entering Select2 and being allowed to call
@@ -52,6 +52,8 @@ KEEPALIVE_SECONDS = _int("KEEPALIVE_SECONDS", 240)
 SELECT2_WAIT_SECONDS = _int("SELECT2_WAIT_SECONDS", 55)
 # How often to live-refresh ALL courses' bookable sections while engaged.
 SECTIONS_REFRESH_SECONDS = _int("SECTIONS_REFRESH_SECONDS", 10)
+# How often the always-on seat-fill Monitors loop checks each watched section.
+MONITOR_INTERVAL_SECONDS = _int("MONITOR_INTERVAL_SECONDS", 60)
 # Full wipe when the dashboard goes silent (browser/tab closed). The open dashboard
 # polls /api/status every few seconds, which keeps the session alive; once no
 # authenticated request arrives for this many seconds, the user's poller is stopped
@@ -88,10 +90,16 @@ CATALOG_XLSX = Path(
         str(Path(__file__).resolve().parent.parent / "Offered Course Report.xlsx"),
     )
 )
-# A live copy downloaded from the portal lands in the (writable) data dir and takes
-# precedence over the bundled seed — so the catalog stays current per semester. It is
-# refreshed in the background on login when older than CATALOG_MAX_AGE_HOURS, or on
-# demand via the dashboard's "Refresh catalog" button.
+# A live copy of the catalog lands in the (writable) data dir and takes precedence over
+# the bundled seed — so the catalog stays current per semester. It is refreshed in the
+# background on login when older than CATALOG_MAX_AGE_HOURS, or on demand via the
+# dashboard's "Refresh catalog" button.
+#
+# The live source is now the Offered-Sections page (parsed to JSON, CATALOG_CACHE),
+# which is fast (~2.5s) and carries titles+sections+timing. CATALOG_OVERRIDE is the
+# legacy xlsx written by the old ~30s DownloadOfferedReport path; still honoured on load
+# for backward-compat if a JSON cache isn't present yet.
+CATALOG_CACHE = DATA_DIR / "catalog.json"
 CATALOG_OVERRIDE = DATA_DIR / "Offered Course Report.xlsx"
 CATALOG_MAX_AGE_HOURS = _int("CATALOG_MAX_AGE_HOURS", 24)
 

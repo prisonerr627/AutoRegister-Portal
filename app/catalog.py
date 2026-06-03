@@ -15,9 +15,14 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
+from bs4 import BeautifulSoup
+
 from .schedule import Slot, make_slot
 
 _NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+# A section row title on the Offered page reads "<COURSE> [<SECTION>]"; the section is
+# the LAST bracketed token (a course title may itself embed one, e.g. "... [MBA] [A]").
+_OFFERED_TITLE_RE = re.compile(r"^(.*)\[([^\[\]]+)\]\s*$")
 
 # Header column names -> our keys (matched case-insensitively).
 _COL_MAP = {
@@ -112,6 +117,56 @@ class Catalog:
             )
             if slot:
                 sec["slots"].append(slot)
+        return cls(courses)
+
+    @classmethod
+    def from_offered_html(cls, html: str) -> "Catalog":
+        """Build the catalog from the live Offered-Sections page
+        (/Student/Section/Offered) instead of the xlsx download. The page renders one
+        master table (Class ID · Title · Status · Capcity · Count · Time) listing every
+        section; each Title is "<COURSE> [<SECTION>]" and each Time cell embeds a nested
+        table of "<type> <day> <start> <end> <room>" slot rows. We read only the master
+        table's DIRECT-CHILD rows so the nested time tables don't leak in. (No
+        department column on this page, so it's left blank — the picker doesn't use it.)
+        """
+        soup = BeautifulSoup(html, "lxml")
+        master = heads = None
+        for t in soup.find_all("table"):
+            hs = [th.get_text(strip=True) for th in t.find_all("th")]
+            if "Count" in hs and any(h.startswith("Cap") for h in hs):
+                master, heads = t, hs
+                break
+        if master is None:
+            return cls({})
+        title_i = heads.index("Title")
+        time_i = heads.index("Time")
+        need = max(title_i, time_i)
+        courses: dict[str, dict] = {}
+        for tr in master.find_all("tr", recursive=False):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) <= need:  # header / malformed row
+                continue
+            m = _OFFERED_TITLE_RE.match(tds[title_i].get_text(" ", strip=True))
+            if not m:
+                continue
+            title = " ".join(m.group(1).split()).strip()
+            section = m.group(2).strip()
+            course = courses.setdefault(title, {"title": title, "department": "", "sections": {}})
+            slots: list[Slot] = []
+            sec_type = ""
+            nested = tds[time_i].find("table")
+            if nested:
+                for r in nested.find_all("tr"):
+                    cells = [c.get_text(" ", strip=True) for c in r.find_all("td")]
+                    if len(cells) < 4:
+                        continue
+                    type_, day, start, end = cells[0], cells[1], cells[2], cells[3]
+                    room = cells[4] if len(cells) > 4 else ""
+                    slot = make_slot(day, start, end, type_, room)
+                    if slot:
+                        slots.append(slot)
+                        sec_type = sec_type or type_
+            course["sections"][section] = {"section": section, "type": sec_type, "slots": slots}
         return cls(courses)
 
     def titles(self) -> list[str]:

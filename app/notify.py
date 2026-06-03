@@ -1,12 +1,17 @@
 """Discord webhook notifications."""
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
 
 from . import config
 from .applog import log
+
+# Strong refs to in-flight fire-and-forget sends so the event loop doesn't GC a task
+# mid-request (asyncio only holds weak refs to tasks).
+_pending: set[asyncio.Task] = set()
 
 
 async def discord_send(
@@ -41,3 +46,24 @@ async def discord_send(
     except Exception as e:  # pragma: no cover
         log.exception("discord_send failed: %s", e)
         return False
+
+
+def discord_notify(
+    content: str,
+    image_bytes: bytes | None = None,
+    filename: str = "image.png",
+) -> None:
+    """Fire-and-forget Discord post: schedule the webhook send as a background task and
+    return immediately, so a round-trip (up to discord_send's 15s timeout) never sits in
+    a latency-critical path — notably the registration drop→register sequence, where an
+    awaited send would delay grabbing the seat (and widen the drop→register gap). Use
+    this for notifications; use `await discord_send(...)` only when delivery must be
+    confirmed before proceeding. Safe to call with no running loop (no-op)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        log.debug("discord_notify: no running loop; dropping: %s", content[:80])
+        return
+    task = loop.create_task(discord_send(content, image_bytes, filename))
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)

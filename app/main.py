@@ -523,9 +523,17 @@ async def clash_check(payload: dict = Body(...), c: Caller = Depends(caller)):
     days = [d for d in (payload.get("days") or []) if d]
     ts = (payload.get("time_start") or "").strip()
     te = (payload.get("time_end") or "").strip()
-    start_str = ts if parse_time_to_minutes(ts) is not None else "12:00 AM"
-    end_str = te if parse_time_to_minutes(te) is not None else "11:59 PM"
-    window_slots = [s for d in (days or WEEKDAYS) if (s := make_slot(d, start_str, end_str))]
+    # An EMPTY window (no days AND no time bounds — e.g. a section-scoped alert that has
+    # no day/time filter) is not "all day, every day": treating it that way trivially
+    # overlaps every registered course, a useless flood. With no real window we skip the
+    # time-overlap check entirely and report only the same-course supersede below.
+    has_window = bool(days or ts or te)
+    if has_window:
+        start_str = ts if parse_time_to_minutes(ts) is not None else "12:00 AM"
+        end_str = te if parse_time_to_minutes(te) is not None else "11:59 PM"
+        window_slots = [s for d in (days or WEEKDAYS) if (s := make_slot(d, start_str, end_str))]
+    else:
+        window_slots = []
 
     clashing = find_clashes(window_slots, registered)
     # Same-course supersede (mirrors poller._try_join so the preview matches what
@@ -541,6 +549,7 @@ async def clash_check(payload: dict = Body(...), c: Caller = Depends(caller)):
     clash_titles = sorted({x["title"] for x in drop_targets})
     return {
         "mode": "window",
+        "has_window": has_window,
         "window": {"days": days, "time_start": ts, "time_end": te},
         "clashes": [{"title": x["title"], "section": x["section"]} for x in clashing],
         "same_course": [{"title": x["title"], "section": x["section"]} for x in same_course],

@@ -275,16 +275,22 @@ $("checkClash").onclick = async () => {
     return;
   }
   if (!r.clash_course_titles.length) {
-    $("clashMsg").textContent = `No clashes ✅ — your window (${winLabel}) is free of registered classes. ${src}.`;
+    // No window means a section-scoped check with no time filter — only the same-course
+    // supersede was evaluated, so word the all-clear accordingly.
+    $("clashMsg").textContent = r.has_window
+      ? `No clashes ✅ — your window (${winLabel}) is free of registered classes. ${src}.`
+      : `No clashes ✅ — you're not already registered in this course. ${src}.`;
     clearTargets();
     return;
   }
-  // Distinguish the two reasons so the message is accurate when a course is flagged
-  // purely because you're already in it (no time overlap).
+  // Two independent reasons a course can be flagged: a real time overlap with the
+  // window, and/or already being registered in the same course (no overlap needed).
   const parts = [];
-  if (r.clashes.length) parts.push(`overlaps ${r.clashes.map(x => `${x.title} [${x.section}]`).join(", ")}`);
-  if (sameCourse.length) parts.push(`already registered in the same course: ${sameCourse.map(x => `${x.title} [${x.section}]`).join(", ")}`);
-  $("clashMsg").textContent = `⚠️ Your window (${winLabel}) ${parts.join("; ")}.  (${src})`;
+  if (r.clashes.length) parts.push(`your window (${winLabel}) overlaps ${r.clashes.map(x => `${x.title} [${x.section}]`).join(", ")}`);
+  if (sameCourse.length) parts.push(`you're already registered in the same course: ${sameCourse.map(x => `${x.title} [${x.section}]`).join(", ")}`);
+  let body = parts.join("; ");
+  body = body[0].toUpperCase() + body.slice(1);
+  $("clashMsg").textContent = `⚠️ ${body}.  (${src})`;
   $("targetChecks").innerHTML = r.clash_course_titles.map(t =>
     `<label><input type="checkbox" class="tgtChk" value="${esc(t)}" checked> ${esc(t)}</label>`).join("<br>");
 };

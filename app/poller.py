@@ -218,8 +218,11 @@ class Engine:
                             await self._refresh_all_sections(prereg, force=not db.get_meta(self.user, "sections_cache"))
                 else:
                     # Idle — don't touch the registration workspace at all.
-                    db.set_meta(self.user, "select2_done", False)
-                    db.set_meta(self.user, "select2_at", None)
+                    # Do NOT clear select2_done / select2_at here: those are only reset
+                    # on an actual re-login (via _login_epoch in _ensure_session) or on
+                    # explicit logout (_reset_dashboard). Clearing them on every idle
+                    # transition forces an unnecessary Select2 + 2-min wait every time
+                    # the window reopens within the same session.
                     db.set_meta(self.user, "prereg_unlocks_in", None)
                     db.set_meta(self.user, "forced_logged", False)
                     db.set_meta(self.user, "sections_cache", None)

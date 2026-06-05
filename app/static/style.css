@@ -48,6 +48,21 @@ th { color: var(--muted); font-weight: 600; }
 .secline button { padding: 3px 10px; font-size: 12px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
+/* ── Mobile: the 3-column tables (registerable / monitors / catalog) overflow a phone
+   in auto layout — a section line's 180px-min timing column pushes the table past the
+   viewport and clips the text off the right edge. Pin the layout to the container width
+   and let cells wrap. ── */
+@media (max-width: 640px) {
+  .wrap { padding: 10px; }
+  .panel { padding: 13px 12px; }
+  table { table-layout: fixed; }
+  th, td { padding: 6px 5px; overflow-wrap: anywhere; }
+  /* Timing drops onto its own full-width line and wraps, instead of holding a 180px
+     min-width that blows the column out past the screen. */
+  .secline { gap: 6px 8px; }
+  .secline .time { flex: 1 1 100%; min-width: 0; }
+  .secline .seats { min-width: 0; }
+}
 .log { font-family: ui-monospace, monospace; font-size: 12px; max-height: 280px;
   overflow-y: auto; background: #0b0f14; border-radius: 7px; padding: 10px; }
 .log .error { color: var(--red); } .log .warn { color: var(--amber); } .log .info { color: var(--muted); }

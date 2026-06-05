@@ -526,6 +526,31 @@ async function refreshMonitors() {
   let r; try { r = await api("/api/monitors"); } catch { return; }
   const monitors = r.monitors || [];
   $("noMonitors").style.display = monitors.length ? "none" : "block";
+
+  // When the registration flow holds the shared session, explain why monitors are
+  // paused and offer the opt-in to run them anyway (borrows the same live session).
+  const banner = $("monOpenBanner");
+  if (r.registration_open || r.force_workspace) {
+    const why = r.registration_open ? "Registration is OPEN" : "Force flow is ON";
+    const state = r.run_when_open
+      ? "running anyway (sharing your live session)"
+      : "paused to protect your live registration session";
+    banner.style.display = "";
+    banner.innerHTML = `⚠ ${why} — seat monitors are <b>${state}</b>.
+      <label class="opt" style="display:block;margin-top:6px">
+        <input type="checkbox" id="monRunOpen" ${r.run_when_open ? "checked" : ""}/>
+        Run monitors during open registration <small class="muted">(shares the one
+        session — may add a brief delay to a poll, but never logs you out)</small>
+      </label>`;
+    $("monRunOpen").onchange = async (e) => {
+      try { await api("/api/monitors/run-when-open", { method: "POST", body: JSON.stringify({ enabled: e.target.checked }) }); }
+      catch {}
+      refreshMonitors();
+    };
+  } else {
+    banner.style.display = "none";
+  }
+
   $("monitorRows").innerHTML = monitors.map(m => {
     const checked = m.last_checked_at ? `checked ${new Date(m.last_checked_at).toLocaleTimeString()}` : "not checked yet";
     if (m.mode === "new_section") {

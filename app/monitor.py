@@ -124,11 +124,26 @@ class MonitorManager:
             by_user[m["username"]].append(m)
 
         for username, mons in by_user.items():
-            # Gate: don't fight a live registration session. If this user's dashboard
-            # poller is engaged (window open / force-flow), skip them this cycle.
+            # The registration flow and the monitor share ONE portal session (AIUB allows a
+            # single live session per account). When this user's dashboard poller is engaged
+            # (window open / force-flow), by DEFAULT we stand aside so the monitor's ~2.5s
+            # Offered-page fetch never stalls the live registration. The user can opt in
+            # (monitor_when_open) to run anyway: we then BORROW the same live session — no
+            # second login, so no cookie-rotation kick — accepting that the shared ASP.NET
+            # session lock may briefly delay a registration poll.
             if db.get_meta(username, "registration_open", False) or db.get_meta(username, "force_workspace", False):
-                log.debug("monitor[%s]: dashboard engaged (open/force) — skipping cycle", username)
-                continue
+                if not db.get_meta(username, "monitor_when_open", False):
+                    reason = ("registration open"
+                              if db.get_meta(username, "registration_open", False) else "force flow")
+                    paused = f"paused — {reason}"
+                    # Surface the pause clearly (was silently "not checked yet"): stamp the
+                    # status + last_checked_at once, on entering the paused state.
+                    for m in mons:
+                        if m["status"] != paused:
+                            db.update_monitor(m["id"], {"status": paused, "last_checked_at": _now()})
+                    log.debug("monitor[%s]: dashboard engaged (%s) — paused (opt-in off)", username, reason)
+                    continue
+                log.debug("monitor[%s]: dashboard engaged but monitor_when_open on — borrowing live session", username)
             session = await self._session_for(username)
             if session is None:
                 for m in mons:

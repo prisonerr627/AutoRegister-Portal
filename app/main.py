@@ -591,7 +591,28 @@ async def get_monitors(c: Caller = Depends(caller)):
                         for s in sec["slots"]
                     )
         m["routine"] = routine
-    return {"monitors": monitors}
+    u = c.ctx.username
+    return {
+        "monitors": monitors,
+        # Lets the panel show why monitors are paused + the opt-in toggle without a
+        # second round-trip to /api/status.
+        "run_when_open": db.get_meta(u, "monitor_when_open", False),
+        "registration_open": db.get_meta(u, "registration_open", False),
+        "force_workspace": db.get_meta(u, "force_workspace", False),
+    }
+
+
+@app.post("/api/monitors/run-when-open", dependencies=[Depends(require_auth)])
+async def monitors_run_when_open(payload: dict = Body(default={}), c: Caller = Depends(caller)):
+    """Opt in/out of running seat monitors while the registration window is open (or
+    force-flow is on). When ON, the monitor borrows the live registration session (no
+    second login) — it may add a brief delay to a poll but never kicks the session."""
+    u = _ctx(c).username
+    enabled = bool((payload or {}).get("enabled"))
+    db.set_meta(u, "monitor_when_open", enabled)
+    db.log_event(u, "info",
+                 f"🪑 Run monitors during open registration {'ENABLED' if enabled else 'disabled'}")
+    return {"run_when_open": enabled}
 
 
 @app.post("/api/monitors", dependencies=[Depends(require_auth)])

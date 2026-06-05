@@ -303,8 +303,22 @@ async def login(request: Request, payload: dict = Body(default={})):
         db.set_meta(u, "needs_captcha", True)
         return JSONResponse({"ok": False, "needs_captcha": True, "captcha_image": e.image_b64}, status_code=200)
     except LoginError as e:
-        db.set_meta(u, "login_error", str(e))
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+        msg = str(e)
+        db.set_meta(u, "login_error", msg)
+        # A wrong captcha (auto-solve misread it) shouldn't dead-end with a hidden
+        # field — re-arm the captcha with a fresh image so the user can read it and
+        # retry manually instead of having to click Log in a second time.
+        if "captcha" in msg.lower():
+            try:
+                img = await ctx.session.prepare_login()
+            except Exception:
+                img = None
+            db.set_meta(u, "needs_captcha", bool(img))
+            return JSONResponse(
+                {"ok": False, "needs_captcha": bool(img), "captcha_image": img, "error": msg},
+                status_code=200,
+            )
+        return JSONResponse({"ok": False, "error": msg}, status_code=200)
 
 
 def _reset_dashboard(user: str) -> None:

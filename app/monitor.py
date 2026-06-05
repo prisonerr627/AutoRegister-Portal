@@ -58,6 +58,10 @@ class MonitorManager:
         # The monitor's OWN durable sessions, keyed by username — used only when that
         # user has no live dashboard session to borrow.
         self._sessions: dict[str, PortalSession] = {}
+        # Usernames we've already announced as captcha-blocked, so the warning fires
+        # once per blocked episode (not every MONITOR_INTERVAL_SECONDS cycle). Cleared
+        # when that user's session recovers.
+        self._captcha_blocked: set[str] = set()
 
     def start(self) -> None:
         if not self.task or self.task.done():
@@ -73,6 +77,31 @@ class MonitorManager:
             except Exception:  # noqa: BLE001
                 pass
             self.task = None
+
+    async def _notify_captcha_blocked(self, username: str, session: PortalSession | None) -> None:
+        """Surface a monitor stuck on an unsolvable login captcha — ONCE per blocked
+        episode (not every cycle), via the activity log + Discord. The fix is to open
+        the dashboard and log in, which the monitor then borrows (single-session safe)."""
+        if username in self._captcha_blocked:
+            return  # already announced this episode
+        self._captcha_blocked.add(username)
+        name = (session.display_name if session else "") or username
+        db.log_event(username, "warn",
+                     "🧩 Monitor login needs a manual captcha (auto-solve failed) — open the "
+                     "dashboard and log in so the monitor can borrow your session")
+        await discord_send(
+            f"[{name}] 🧩 **Seat monitor blocked** — login captcha couldn't be auto-solved. "
+            "Open the AutoRegister dashboard and log in to resume monitoring.",
+            image_bytes=session._captcha_bytes if session else None,
+            filename="captcha.gif",
+        )
+
+    def _clear_captcha_blocked(self, username: str) -> None:
+        """A session was obtained for this user — clear any captcha-blocked state so a
+        future block re-announces (and note the recovery in the log)."""
+        if username in self._captcha_blocked:
+            self._captcha_blocked.discard(username)
+            db.log_event(username, "info", "✅ Monitor login recovered — captcha block cleared")
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -111,6 +140,7 @@ class MonitorManager:
             try:
                 sections = await session.offered_sections()
             except NeedCaptcha:
+                await self._notify_captcha_blocked(username, session)
                 for m in mons:
                     db.update_monitor(m["id"], {"status": "needs login", "last_checked_at": _now()})
                 continue
@@ -133,6 +163,7 @@ class MonitorManager:
         ctx = manager._contexts.get(username)
         if ctx is not None:
             if ctx.session.logged_in and ctx.session.cookies.get("NAABSUMSMVCFORMSAUTH"):
+                self._clear_captcha_blocked(username)  # live session resolves any block
                 return ctx.session
             # Dashboard context exists but isn't authenticated — let the dashboard
             # sort out its own login rather than racing a second one.
@@ -148,9 +179,11 @@ class MonitorManager:
         if not (sess.logged_in and sess.cookies.get("NAABSUMSMVCFORMSAUTH")):
             try:
                 await sess.auto_login()
+                self._clear_captcha_blocked(username)
                 db.log_event(username, "info", f"🪑 Monitor logged in as {sess.display_name or username}")
             except NeedCaptcha:
                 log.warning("monitor[%s]: own-session login needs a captcha — can't auto-solve", username)
+                await self._notify_captcha_blocked(username, sess)
                 return None
             except LoginError as e:
                 log.warning("monitor[%s]: own-session login failed: %s", username, e)

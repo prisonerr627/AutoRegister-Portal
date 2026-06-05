@@ -85,7 +85,12 @@ async function refreshStatus() {
   $("logoutBtn").classList.toggle("hidden", !s.logged_in);
   if (!s.logged_in && s.username && !$("liUser").value) $("liUser").value = s.username;
   $("liCaptcha").classList.toggle("hidden", !s.needs_captcha);
-  if (s.needs_captcha) loadCaptcha();
+  // Load the captcha image only ONCE when it's first required — never refetch on
+  // every poll. Each fetch regenerates the portal's captcha (new image + token),
+  // swapping it out from under the user and invalidating the answer they just
+  // typed. Fresh images arrive via the /api/login response or a click on the image.
+  if (s.needs_captcha) { if (!$("liCaptchaImg").getAttribute("src")) loadCaptcha(); }
+  else $("liCaptchaImg").removeAttribute("src");
   if (s.login_error) { $("liError").textContent = s.login_error; lp.title = s.login_error; }
 }
 $("forceBtn").onclick = async () => {
@@ -105,11 +110,16 @@ async function doLogin(extra) {
   $("liError").textContent = "";
   const body = Object.assign({ username: $("liUser").value, password: $("liPass").value }, extra || {});
   const r = await api("/api/login", { method: "POST", body: JSON.stringify(body) });
-  if (r.ok) { $("liPass").value = ""; $("liCaptcha").classList.add("hidden"); }
-  else if (r.needs_captcha) { $("liCaptcha").classList.remove("hidden"); if (r.captcha_image) $("liCaptchaImg").src = "data:image/gif;base64," + r.captcha_image; }
+  if (r.ok) { $("liPass").value = ""; $("liCaptcha").classList.add("hidden"); $("liCaptchaImg").removeAttribute("src"); }
+  else if (r.needs_captcha) { $("liCaptcha").classList.remove("hidden"); if (r.captcha_image) $("liCaptchaImg").src = "data:image/gif;base64," + r.captcha_image; if (r.error) $("liError").textContent = r.error; }
   else if (r.error) $("liError").textContent = r.error;
   refreshStatus();
 }
+// Click the captcha to deliberately pull a fresh one (the only place that should
+// regenerate it besides a failed login response).
+$("liCaptchaImg").title = "click for a fresh captcha";
+$("liCaptchaImg").style.cursor = "pointer";
+$("liCaptchaImg").onclick = () => loadCaptcha();
 $("liBtn").onclick = () => doLogin();
 $("liPass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
 $("liCaptchaBtn").onclick = () => { doLogin({ answer: $("liCaptchaAns").value }); $("liCaptchaAns").value = ""; };

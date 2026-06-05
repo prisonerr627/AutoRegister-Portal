@@ -400,6 +400,11 @@ function renderCourses(courses, open) {
     const secs = (c.RegisterableSections || []);
     secs.forEach(s => { SECMAP[s.ID] = s; });
     const cr = courseCredit(c);
+    // The portal's course-level Status can say "Registered" while no section has
+    // Registered:true (AIUB quirk for auto-enrolled lab courses). When sections are
+    // loaded, derive the status from them — the sections are the ground truth.
+    const hasRegisteredSec = secs.some(s => s.Registered && !s.Dropped);
+    const displayStatus = secs.length > 0 ? (hasRegisteredSec ? "Registered" : "None") : c.Status;
     const lines = secs.map(s => {
       const isOpen = s.Capacity > s.StudentCount && !s.Registered;
       const badge = s.Registered ? "secbadge reg" : (isOpen ? "secbadge open" : "secbadge full");
@@ -417,7 +422,7 @@ function renderCourses(courses, open) {
     const loadBtn = `<div class="secline"><button class="ghost" onclick="loadCourse(${c.OfferedCourseId}, this)" title="Reload just this course's sections">load sections</button></div>`;
     return `<tr>
       <td><b>${esc(c.Title)}</b><br><small class="muted">${cr} credit${cr === 1 ? "" : "s"}</small></td>
-      <td><span class="tag">${esc(c.Status)}</span></td>
+      <td><span class="tag">${esc(displayStatus)}</span></td>
       <td>${body}${loadBtn}</td>
     </tr>`;
   }).join("");

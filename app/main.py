@@ -86,7 +86,7 @@ def _load_catalog() -> None:
 
 async def refresh_catalog(session) -> dict:
     """Rebuild the catalog from the live Offered-Sections page (GET /Student/Section/
-    Offered?q=…) via a logged-in session, persist it as the JSON cache, and reload the
+    Offered directly — no q token needed), persist it as the JSON cache, and reload the
     global catalog. Replaces the old ~30s DownloadOfferedReport xlsx path. Returns
     {ok, count, error}."""
     global _catalog_refreshing

@@ -41,7 +41,6 @@ _REG_Q_RE = re.compile(r"/Student/Registration\?q=[^\"'<>\s]+")
 # /Student dashboard) renders every section inline with live seat counts AND timing —
 # the single source for both the seat Monitors and the course/section catalog picker
 # (replacing the old slow ~30s xlsx download).
-_OFFERED_Q_RE = re.compile(r"/Student/Section/Offered\?q=[^\"'<>\s]+")
 # The Offered page renders every section's row title as "<COURSE TITLE> [<SECTION>]"
 # — and a course title may itself embed a bracket ("PRINCIPLES OF ACCOUNTING [MBA]
 # [A]"), so the SECTION is the LAST bracketed token and the course is everything
@@ -665,14 +664,9 @@ class PortalSession:
         """Read live seat counts per section from the portal's Offered-Sections page
         (/Student/Section/Offered) WITHOUT entering the registration workspace — so it
         sidesteps the Select2 ~49s server timer and is safe on the always-on Monitors
-        cadence. The page lists EVERY section inline (no search submit / ajax needed);
-        we just GET it and parse the master table. Returns [{"course","section",
-        "filled","capacity","title"}], filtered to `course` when given (else all).
-
-        Flow: GET /Student → scrape the Offered page's q token (reuse _OFFERED_Q_RE) →
-        GET /Student/Section/Offered?q=<token> → parse. (~1.3 MB page; the monitor
-        fetches it once per user per cycle and matches all that user's monitors against
-        the result.)"""
+        cadence. The page lists EVERY section inline; we GET it directly (no q token
+        needed) and parse the master table. Returns [{"course","section","filled",
+        "capacity","title"}], filtered to `course` when given (else all)."""
         html = await self.offered_html()
         sections = self._parse_offered_sections(html, course)
         log.info("offered_sections[%s] course=%r -> %d section(s)",
@@ -680,15 +674,8 @@ class PortalSession:
         return sections
 
     async def offered_html(self) -> str:
-        """Fetch the raw Offered-Sections page HTML (GET /Student → scrape the
-        /Student/Section/Offered?q=<token> link → GET it). Shared by offered_sections()
-        (live seat counts) and the catalog refresh (course/section/timing picker) — both
-        parse this one ~1.3 MB page instead of the slow ~30s xlsx download."""
+        """Fetch the raw Offered-Sections page HTML. /Student/Section/Offered is
+        accessible with just the auth cookie — no q token needed."""
         async with self._lock:
-            home = await self._request("GET", "/Student", referer=f"{PORTAL}/")
-        qm = _OFFERED_Q_RE.search(home.text)
-        if not qm:
-            raise LoginError("could not find the Offered-courses link on the dashboard")
-        async with self._lock:
-            page = await self._request("GET", qm.group(0), referer=f"{PORTAL}/Student")
+            page = await self._request("GET", "/Student/Section/Offered", referer=f"{PORTAL}/Student")
         return page.text
